@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+langgraph
+langchain
+faiss-cpu
+docker
+e2b
+playwright
+mlflow
+websockets
+pydantic
+python-dotenv
