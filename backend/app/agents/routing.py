@@ -121,8 +121,11 @@ def decide(after_node: str, state: RunState, limits: Limits) -> Decision:
         elif dgr == DiffGateResult.SCHEMA_INVALID:
             retries = state.get("diff_schema_retries", 0)
             if retries <= limits.diff_schema_retries:
-                producer = state.get("diff_producer", "coder")
-                result = Decision(producer)
+                producer = state.get("diff_producer")
+                if producer in ("coder", "debugger"):
+                    result = Decision(producer)
+                else:
+                    result = Decision("escalate", StopReason.ERROR)
             else:
                 result = Decision("escalate", StopReason.DIFF_SCHEMA_RETRIES_EXHAUSTED)
         else:

@@ -2,7 +2,7 @@
 
 from pydantic import ValidationError
 from langgraph.graph import StateGraph, START, END
-from langgraph.types import interrupt, Command
+from langgraph.types import interrupt
 from langgraph.checkpoint.memory import MemorySaver
 
 from app.agents.routing import Limits, decide, make_router
@@ -12,8 +12,6 @@ from app.agents.schemas import (
     Plan,
     PlanAuthor,
     PlanStatus,
-    PlanStep,
-    Requirement,
     RunState,
     RunStatus,
     StopReason,
@@ -28,7 +26,7 @@ REQUIRED_NODE_KEYS = frozenset({
 })
 
 
-def _human_approval(state: RunState, limits: Limits) -> dict | Command:
+def _human_approval(state: RunState, limits: Limits) -> dict:
     """Human-in-the-loop approval interrupt node."""
     plans = state.get("plan_versions", [])
     latest_plan = plans[-1] if plans else None

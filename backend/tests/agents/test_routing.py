@@ -256,6 +256,29 @@ def test_diff_gate_schema_invalid_under_limit_debugger():
     assert decide("diff_gate", s, LIMITS).next_node == "debugger"
 
 
+@pytest.mark.parametrize("bad_producer", [None, "unknown", "reviewer", "planner"])
+def test_diff_gate_schema_invalid_bad_producer(bad_producer):
+    """schema_invalid with bad/unknown/None producer -> escalate (error)."""
+    s = _base_state(
+        diff_gate_result=DiffGateResult.SCHEMA_INVALID,
+        diff_producer=bad_producer,
+        diff_schema_retries=LIMITS.diff_schema_retries,
+    )
+    d = decide("diff_gate", s, LIMITS)
+    assert d == Decision("escalate", StopReason.ERROR)
+
+
+def test_diff_gate_schema_invalid_missing_producer():
+    """schema_invalid with missing diff_producer field -> escalate (error)."""
+    s = _base_state(
+        diff_gate_result=DiffGateResult.SCHEMA_INVALID,
+        diff_schema_retries=LIMITS.diff_schema_retries,
+    )
+    s.pop("diff_producer", None)
+    d = decide("diff_gate", s, LIMITS)
+    assert d == Decision("escalate", StopReason.ERROR)
+
+
 def test_diff_gate_schema_invalid_over_limit():
     """schema_invalid, retries over limit -> escalate."""
     s = _base_state(
