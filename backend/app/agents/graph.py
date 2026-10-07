@@ -11,7 +11,6 @@ from app.agents.schemas import (
     ApprovalResponse,
     Plan,
     PlanAuthor,
-    PlanStatus,
     RunState,
     RunStatus,
     StopReason,
@@ -62,7 +61,6 @@ def _human_approval(state: RunState, limits: Limits) -> dict:
             new_plan = Plan(
                 version_id=new_vid,
                 author=PlanAuthor.HUMAN,
-                status=PlanStatus.DRAFT,
                 intent=response.edited_plan.intent,
                 scope=response.edited_plan.scope,
                 non_goals=response.edited_plan.non_goals,
@@ -129,12 +127,24 @@ def run_config(run_id: str) -> dict:
     return {"configurable": {"thread_id": run_id}}
 
 
+def default_nodes() -> dict[str, callable]:
+    """Return default nodes with real Triage and fake other nodes."""
+    from app.agents.fake_nodes import Scenario, make_fake_nodes
+    from app.agents.triage_agent import triage_node
+    nodes = make_fake_nodes(Scenario())
+    nodes["triage"] = triage_node
+    return nodes
+
+
 def build_graph(
-    nodes: dict[str, callable],
+    nodes: dict[str, callable] | None = None,
     limits: Limits | None = None,
     checkpointer=None,
 ):
     """Build and compile the Mini-Devin supervisor StateGraph."""
+    if nodes is None:
+        nodes = default_nodes()
+
     missing = REQUIRED_NODE_KEYS - set(nodes.keys())
     if missing:
         raise ValueError(f"Missing required node keys: {sorted(missing)}")

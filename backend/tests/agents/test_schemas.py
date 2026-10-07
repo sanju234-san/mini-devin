@@ -20,7 +20,6 @@ from app.agents.schemas import (
     ModelKind,
     Plan,
     PlanAuthor,
-    PlanStatus,
     PlanStep,
     Requirement,
     RetrievedChunk,
@@ -37,6 +36,7 @@ from app.agents.schemas import (
     TokenUsage,
     build_reviewer_input,
     get_approved_plan,
+    plan_state,
     validate_diff_against_plan,
     validate_review_against_plan,
 )
@@ -51,7 +51,6 @@ def sample_plan(version_id: str = "v1") -> Plan:
     return Plan(
         version_id=version_id,
         author=PlanAuthor.PLANNER,
-        status=PlanStatus.APPROVED,
         intent="Fix bug",
         scope="auth module",
         non_goals="ui",
@@ -80,7 +79,6 @@ def test_plan_failures():
         Plan(
             version_id="v1",
             author=PlanAuthor.PLANNER,
-            status=PlanStatus.DRAFT,
             intent="Fix",
             scope="All",
             non_goals="None",
@@ -95,7 +93,6 @@ def test_plan_failures():
         Plan(
             version_id="v1",
             author=PlanAuthor.PLANNER,
-            status=PlanStatus.DRAFT,
             intent="Fix",
             scope="All",
             non_goals="None",
@@ -110,7 +107,6 @@ def test_plan_failures():
         Plan(
             version_id="v1",
             author=PlanAuthor.PLANNER,
-            status=PlanStatus.DRAFT,
             intent="Fix",
             scope="All",
             non_goals="None",
@@ -125,7 +121,6 @@ def test_plan_failures():
         Plan(
             version_id="v1",
             author=PlanAuthor.PLANNER,
-            status=PlanStatus.DRAFT,
             intent="Fix",
             scope="All",
             non_goals="None",
@@ -506,7 +501,7 @@ def test_step_event_rules():
 
 
 def test_stop_reason_values():
-    """Verify StopReason enum contains exactly the 11 designated stop reasons."""
+    """Verify StopReason enum contains exactly the 12 designated stop reasons."""
     expected = {
         "injection_suspected",
         "plan_schema_retries_exhausted",
@@ -519,6 +514,7 @@ def test_stop_reason_values():
         "run_budget",
         "sandbox_error",
         "error",
+        "triage_uncertain",
     }
     actual = {r.value for r in StopReason}
     assert actual == expected
@@ -605,3 +601,45 @@ def test_run_state_extensions():
     assert state.get("diff_producer") == "coder"
     assert state.get("last_approval").decision == ApprovalDecision.APPROVE  # type: ignore
     assert state.get("node_error") == StopReason.ERROR
+
+
+def test_plan_status_field_rejected():
+    """Constructing a Plan with a status field is rejected (extra="forbid")."""
+    with pytest.raises(ValidationError):
+        Plan(
+            version_id="v1",
+            author=PlanAuthor.PLANNER,
+            status="draft",  # extra field — must be rejected
+            intent="Fix",
+            scope="All",
+            non_goals="None",
+            affected_files=["foo.py"],
+            requirements=[Requirement(id="R1", description="D", acceptance_criterion="A")],
+            steps=[PlanStep(description="S", requirement_ids=["R1"], files=["foo.py"])],
+            expected_tests=[],
+        )
+
+
+def test_plan_state_returns_correct_values():
+    """plan_state returns approved, superseded and pending correctly."""
+    p1 = sample_plan("v1")
+    p2 = sample_plan("v2")
+    p3 = sample_plan("v3")
+    state: RunState = {
+        "plan_versions": [p1, p2, p3],
+        "approved_version": "v2",
+    }
+    assert plan_state(state, "v2") == "approved"
+    assert plan_state(state, "v1") == "superseded"
+    assert plan_state(state, "v3") == "pending"
+
+
+def test_plan_state_raises_for_unknown_version():
+    """plan_state raises ValueError for an unknown version id."""
+    p1 = sample_plan("v1")
+    state: RunState = {
+        "plan_versions": [p1],
+        "approved_version": "v1",
+    }
+    with pytest.raises(ValueError, match="not found in state plan_versions"):
+        plan_state(state, "v99")

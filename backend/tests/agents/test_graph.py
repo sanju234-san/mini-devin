@@ -11,7 +11,6 @@ from app.agents.schemas import (
     DiffGateResult,
     Plan,
     PlanAuthor,
-    PlanStatus,
     PlanStep,
     Requirement,
     ReviewOutcome,
@@ -105,6 +104,22 @@ def test_out_of_scope():
     assert snap.next == ()
     assert snap.values["status"] == RunStatus.OUT_OF_SCOPE
     assert sc.calls == ["intake", "input_guardrail", "triage"]
+
+
+def test_triage_low_confidence():
+    """Run with triage_confidence=0.3 ends escalated with TRIAGE_UNCERTAIN and retrieval not called."""
+    sc = Scenario(triage_confidence=0.3)
+    nodes = make_fake_nodes(sc)
+    g = build_graph(nodes, Limits())
+
+    state = new_run_state("r2b", "o/r", 2, "Unclear request")
+    config = run_config("r2b")
+
+    snap = _run_until_interrupt(g, state, config)
+    assert snap.next == ()
+    assert snap.values["status"] == RunStatus.ESCALATED
+    assert snap.values["stop_reason"] == StopReason.TRIAGE_UNCERTAIN
+    assert "retrieval" not in sc.calls
 
 
 # --- Guardrail injection ---
@@ -434,7 +449,6 @@ def test_edit_then_reject_then_planner():
     edited = Plan(
         version_id="will_be_overridden",
         author=PlanAuthor.HUMAN,
-        status=PlanStatus.DRAFT,
         intent="Human revised intent",
         scope="target module",
         non_goals="none",
@@ -518,3 +532,99 @@ def test_approve_clears_prior_rejection_feedback():
     final = snap.values
     assert final["status"] == RunStatus.PR_OPENED
     assert final["approval_feedback"] is None
+
+
+# --- 7a. Writer-blind at graph level ---
+
+def test_writer_blind_at_graph_level():
+    """Coder reasoning must not appear in final state; it goes only to scenario.trace."""
+    sc = Scenario()
+    nodes = make_fake_nodes(sc)
+    g = build_graph(nodes, Limits())
+
+    run_id = "test_writer_blind"
+    state = new_run_state(run_id, "o/r", 40, "Bug")
+    config = run_config(run_id)
+
+    snap = _run_until_interrupt(g, state, config)
+    assert snap.next == ("human_approval",)
+    approve = ApprovalResponse(decision=ApprovalDecision.APPROVE)
+    snap = _resume(g, config, approve.model_dump())
+    assert snap.next == ()
+    assert snap.values["status"] == RunStatus.PR_OPENED
+
+    final_repr = repr(snap.values)
+    assert "Coder reasoning" not in final_repr
+    assert any("Coder reasoning" in t for t in sc.trace)
+
+
+# --- 7b. Call-order assertions in guardrail/diff-gate tests ---
+
+def test_guardrail_blocks_stops_before_triage():
+    """Flagged guardrail -> escalate; triage is never called."""
+    sc = Scenario(guardrail_flagged=True)
+    nodes = make_fake_nodes(sc)
+    g = build_graph(nodes, Limits())
+
+    state = new_run_state("r3b", "o/r", 3, "DROP TABLE")
+    config = run_config("r3b")
+
+    snap = _run_until_interrupt(g, state, config)
+    assert snap.next == ()
+    assert snap.values["status"] == RunStatus.ESCALATED
+    assert snap.values["stop_reason"] == StopReason.INJECTION_SUSPECTED
+    assert "triage" not in sc.calls
+
+
+def test_diff_gate_blocked_stops_before_test_runner():
+    """Diff gate denylist hit -> escalate; test_runner is never called."""
+    sc = Scenario(diff_gate=[DiffGateResult.DENYLIST_HIT])
+    nodes = make_fake_nodes(sc)
+    g = build_graph(nodes, Limits())
+
+    state = new_run_state("r11b", "o/r", 11, "Bug")
+    config = run_config("r11b")
+
+    snap = _run_until_interrupt(g, state, config)
+    assert snap.next == ("human_approval",)
+    approve = ApprovalResponse(decision=ApprovalDecision.APPROVE)
+    snap = _resume(g, config, approve.model_dump())
+    assert snap.next == ()
+    assert snap.values["status"] == RunStatus.ESCALATED
+    assert snap.values["stop_reason"] == StopReason.DIFF_BLOCKED
+    assert "test_runner" not in sc.calls
+
+
+# --- 7c. Plan revisions exhausted at graph level ---
+
+def test_plan_revisions_exhausted_at_graph_level():
+    """Reject repeatedly until exhausted; planner ran limit+1 times."""
+    limits = Limits()  # default plan_revisions = 3
+    sc = Scenario()
+    nodes = make_fake_nodes(sc)
+    g = build_graph(nodes, limits)
+
+    run_id = "test_revisions_exhausted"
+    state = new_run_state(run_id, "o/r", 50, "Bug")
+    config = run_config(run_id)
+
+    # Initial run -> planner (1st) -> human_approval
+    snap = _run_until_interrupt(g, state, config)
+    assert snap.next == ("human_approval",)
+
+    reject_count = 0
+    while snap.next == ("human_approval",):
+        reject = ApprovalResponse(decision=ApprovalDecision.REJECT, feedback=f"Not good {reject_count}")
+        snap = _resume(g, config, reject.model_dump())
+        reject_count += 1
+        if snap.next == ():
+            break
+
+    assert snap.next == ()
+    final = snap.values
+    assert final["status"] == RunStatus.ESCALATED
+    assert final["stop_reason"] == StopReason.PLAN_REVISIONS_EXHAUSTED
+    # Needed exactly limits.plan_revisions + 1 rejects to exhaust
+    assert reject_count == limits.plan_revisions + 1
+    # planner ran once initially plus once per reject before exhaustion
+    assert sc.calls.count("planner") == limits.plan_revisions + 1

@@ -19,14 +19,6 @@ class PlanAuthor(str, Enum):
     HUMAN = "human"
 
 
-class PlanStatus(str, Enum):
-    """Lifecycle status of a plan version."""
-    DRAFT = "draft"
-    APPROVED = "approved"
-    SUPERSEDED = "superseded"
-    REJECTED = "rejected"
-
-
 class ChangeType(str, Enum):
     """Type of file modification."""
     ADD = "add"
@@ -112,6 +104,7 @@ class StopReason(str, Enum):
     REVIEWER_BLOCK = "reviewer_block"
     RUN_BUDGET = "run_budget"
     SANDBOX_ERROR = "sandbox_error"
+    TRIAGE_UNCERTAIN = "triage_uncertain"
     ERROR = "error"
 
 
@@ -149,7 +142,6 @@ class Plan(BaseSchema):
     """Implementation plan proposed by Planner or human editor."""
     version_id: str
     author: PlanAuthor
-    status: PlanStatus
     intent: str
     scope: str
     non_goals: str
@@ -490,3 +482,17 @@ def find_duplicate_plan_versions(state: RunState) -> list[str]:
         else:
             seen.add(vid)
     return duplicates
+
+
+def plan_state(state: RunState, version_id: str) -> str:
+    """Compute plan lifecycle state: approved, superseded, or pending."""
+    plans = state.get("plan_versions", [])
+    version_ids = [p.version_id for p in plans]
+    if version_id not in version_ids:
+        raise ValueError(f"Version ID '{version_id}' not found in state plan_versions")
+    if version_id == state.get("approved_version"):
+        return "approved"
+    idx = version_ids.index(version_id)
+    if idx < len(plans) - 1:
+        return "superseded"
+    return "pending"

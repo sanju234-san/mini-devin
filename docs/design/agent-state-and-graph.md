@@ -9,7 +9,7 @@ Design of the LangGraph StateGraph for Mini-Devin. The Supervisor is determinist
 | Guardrail result | pass/flagged, reason | input guardrail | Supervisor |
 | Triage result | category, classifier confidence, cleaned query | Triage | Supervisor, Retrieval |
 | Retrieval result | code chunks (references + short snippets) | Retrieval | Planner |
-| Plan versions | append-only list; each has version id, author (Planner or human), status | Planner, human | Coder, Reviewer, PR Agent |
+| Plan versions | append-only list; each has version id, author (Planner or human) | Planner, human | Coder, Reviewer, PR Agent |
 | Approved version | pointer to the human-approved plan version | approval step | Coder, Reviewer |
 | Approval feedback | reject reason text for the Planner | human_approval | Planner |
 | Current diff | latest diff, deviation log, change summary | Coder, Debugger | diff gate, Test-Runner, Reviewer |
@@ -50,6 +50,7 @@ State rules:
 |---|---|---|
 | input_guardrail | flagged | END escalated (injection_suspected) |
 | input_guardrail | pass | triage |
+| triage | classifier confidence below the minimum | END escalated (triage_uncertain) |
 | triage | out_of_scope | END out_of_scope |
 | triage | in scope | retrieval |
 | retrieval | always | planner |
@@ -79,6 +80,8 @@ State rules:
 | any LLM call | run_llm_calls at run budget | END escalated (run_budget) |
 | any node | tool, provider or sandbox failure | END escalated (error type); retry policy OPEN |
 
+A low-confidence Triage result stops the run and asks a human; the minimum confidence is a placeholder to be tuned on validation data.
+
 # 5. Human approval interrupt
 The run pauses at human_approval after plan_validation passes. State is checkpointed. Resume payload: decision (approve, edit or reject), plus the edited plan (for edit) or feedback text (for reject). The resume is triggered by Tamanna's api/runs.py approval endpoint using the run id. The Coder cannot run until an approved version is set. Every new plan version needs a fresh human approval.
 
@@ -87,11 +90,11 @@ State is saved after every node, enabling resume, replay and time-travel debuggi
 
 # 7. Counters and end states
 Counters: plan_schema_retries, diff_schema_retries, plan_revisions (rejects only), debug_attempts, review_revisions, run_llm_calls. Limit values: OPEN (to agree with Tamanna; config.py currently has a single MAX_RETRY_ATTEMPTS).
-End states: pr_opened; out_of_scope; escalated with a stop reason from this list: injection_suspected, plan_schema_retries_exhausted, diff_schema_retries_exhausted, plan_revisions_exhausted, diff_blocked, debugger_limit, reviewer_limit, reviewer_block, run_budget, error, sandbox_error.
+End states: pr_opened; out_of_scope; escalated with a stop reason from this list: injection_suspected, plan_schema_retries_exhausted, diff_schema_retries_exhausted, plan_revisions_exhausted, diff_blocked, debugger_limit, reviewer_limit, reviewer_block, run_budget, error, sandbox_error, triage_uncertain.
 Run status values: running, pr_opened, out_of_scope, escalated.
 
 # 8. Open items (do not decide)
-Where the Coder's file tools run (local checkout or sandbox); sandbox creation time and reuse across Debugger retries; where the Reviewer's linter runs; handling of low-confidence Triage results; retry policy for provider and sandbox errors; checkpointer backend; where step events are stored for replay; counter limit values; owner of prompt caching; LangGraph version in use (not pinned in requirements.txt; the interrupt, resume and checkpointer APIs vary between versions); maximum tool steps per looping node; whether the Reviewer may use read-only repo view and search tools; MLflow version and tracing API in use; where the MLflow server runs in development versus docker-compose; trace storage and retention; whether the LLM-as-judge model is the same as the agents' model; whether trace viewing is exposed in the dashboard.
+Where the Coder's file tools run (local checkout or sandbox); sandbox creation time and reuse across Debugger retries; where the Reviewer's linter runs; retry policy for provider and sandbox errors; checkpointer backend; where step events are stored for replay; counter limit values; owner of prompt caching; LangGraph version in use (not pinned in requirements.txt; the interrupt, resume and checkpointer APIs vary between versions); maximum tool steps per looping node; whether the Reviewer may use read-only repo view and search tools; MLflow version and tracing API in use; where the MLflow server runs in development versus docker-compose; trace storage and retention; whether the LLM-as-judge model is the same as the agents' model; whether trace viewing is exposed in the dashboard.
 
 # 9. Mapping to LangGraph
 In LangGraph terms the Supervisor is not a node. It is the compiled graph plus small routing functions that only read state and name the next node. Nodes do the work.

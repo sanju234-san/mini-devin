@@ -22,7 +22,6 @@ from app.agents.schemas import (
     TriageResult,
     Plan,
     PlanAuthor,
-    PlanStatus,
     Requirement,
     PlanStep,
 )
@@ -119,6 +118,29 @@ def test_triage_in_scope():
     assert decide("triage", s, LIMITS).next_node == "retrieval"
 
 
+def test_triage_low_confidence_bug_fix():
+    """Confidence below threshold escalates with TRIAGE_UNCERTAIN for bug_fix."""
+    s = _base_state(triage_result=TriageResult(category=TriageCategory.BUG_FIX, confidence=0.59, cleaned_query="q"))
+    d = decide("triage", s, LIMITS)
+    assert d == Decision("escalate", StopReason.TRIAGE_UNCERTAIN)
+
+
+def test_triage_low_confidence_out_of_scope():
+    """Confidence below threshold escalates with TRIAGE_UNCERTAIN for out_of_scope."""
+    s = _base_state(triage_result=TriageResult(category=TriageCategory.OUT_OF_SCOPE, confidence=0.5, cleaned_query="q"))
+    d = decide("triage", s, LIMITS)
+    assert d == Decision("escalate", StopReason.TRIAGE_UNCERTAIN)
+
+
+def test_triage_threshold_confidence_continues_normally():
+    """Confidence exactly at threshold continues normally."""
+    s_in = _base_state(triage_result=TriageResult(category=TriageCategory.BUG_FIX, confidence=LIMITS.triage_min_confidence, cleaned_query="q"))
+    assert decide("triage", s_in, LIMITS).next_node == "retrieval"
+
+    s_out = _base_state(triage_result=TriageResult(category=TriageCategory.OUT_OF_SCOPE, confidence=LIMITS.triage_min_confidence, cleaned_query="q"))
+    assert decide("triage", s_out, LIMITS).next_node == "finish"
+
+
 # --- retrieval, planner ---
 
 def test_retrieval():
@@ -180,7 +202,6 @@ def test_approval_edit():
     edited = Plan(
         version_id="v-edit",
         author=PlanAuthor.HUMAN,
-        status=PlanStatus.DRAFT,
         intent="New intent",
         scope="target module",
         non_goals="none",
