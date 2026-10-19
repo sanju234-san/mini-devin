@@ -23,4 +23,5 @@ pydantic
 pydantic-settings
 python-dotenv
 scikit-learn
+joblib
 
