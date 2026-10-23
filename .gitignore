@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.pyc
 .venv/
@@ -17,3 +17,20 @@ evaluation/reports/*
 
 # OS
 .DS_Store
+
+backend/app/ml_models/training/data/
+*.pt
+*.bin
+*.safetensors
+*.onnx
+*.faiss
+*.index
+.next/
+.env.local
+.env.*.local
+.pytest_cache/
+htmlcov/
+.coverage
+backend/app/ml_models/artifacts/
+
+

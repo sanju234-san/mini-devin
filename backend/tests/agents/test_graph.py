@@ -1,4 +1,4 @@
-"""
+﻿"""
 Automated tests for Mini-Devin's Day 1 LangGraph workflow and checkpointing.
 
 Verifies:
@@ -36,7 +36,7 @@ def memory_checkpointer() -> MemorySaver:
     return create_checkpointer()
 
 
-# ── Test 1: Graph execution to planner interrupt ────────────────────
+# ΓöÇΓöÇ Test 1: Graph execution to planner interrupt ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 def test_graph_executes_to_planner_interrupt(memory_checkpointer: MemorySaver):
     """Workflow should execute Triage -> Retrieval -> Planner and pause at Human Approval."""
@@ -73,7 +73,7 @@ def test_graph_executes_to_planner_interrupt(memory_checkpointer: MemorySaver):
     assert len(values["plan"]["affected_files"]) > 0
 
 
-# ── Test 2: Plan preserved at human approval interrupt ──────────────
+# ΓöÇΓöÇ Test 2: Plan preserved at human approval interrupt ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 def test_plan_preserved_at_approval_interrupt(memory_checkpointer: MemorySaver):
     """The implementation plan must be accurately persisted in the checkpoint."""
@@ -103,7 +103,7 @@ def test_plan_preserved_at_approval_interrupt(memory_checkpointer: MemorySaver):
     assert "affected_files" in plan
 
 
-# ── Test 3: Approved plan resumes with same thread_id ────────────────
+# ΓöÇΓöÇ Test 3: Approved plan resumes with same thread_id ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 def test_approved_plan_resumes_with_same_thread_id(memory_checkpointer: MemorySaver):
     """Resuming with approval must continue the same thread to completion."""
@@ -140,7 +140,7 @@ def test_approved_plan_resumes_with_same_thread_id(memory_checkpointer: MemorySa
     assert final_state.values["status"] == "completed"
 
 
-# ── Test 4: Rejected plan terminates safely ──────────────────────────
+# ΓöÇΓöÇ Test 4: Rejected plan terminates safely ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 def test_rejected_plan_terminates_safely(memory_checkpointer: MemorySaver):
     """Rejected plans must terminate cleanly without proceeding to code generation."""
@@ -177,7 +177,7 @@ def test_rejected_plan_terminates_safely(memory_checkpointer: MemorySaver):
     assert final_state.values["status"] == "rejected"
 
 
-# ── Test 5: Out-of-scope issues follow safe stopping path ───────────
+# ΓöÇΓöÇ Test 5: Out-of-scope issues follow safe stopping path ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 @pytest.mark.parametrize(
     "out_of_scope_title",
@@ -212,7 +212,7 @@ def test_out_of_scope_issues_safe_stopping_path(
     assert final_output.get("human_approval") is None
 
 
-# ── Test 6: Missing or invalid issue input ──────────────────────────
+# ΓöÇΓöÇ Test 6: Missing or invalid issue input ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 def test_missing_or_invalid_issue_input():
     """Initial state creation must reject invalid inputs with clear errors."""
@@ -250,7 +250,7 @@ def test_triage_node_handles_empty_title_safely():
     assert result["triage"]["is_supported"] is False
 
 
-# ── Test 7: Checkpoint state across resume ──────────────────────────
+# ΓöÇΓöÇ Test 7: Checkpoint state across resume ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 def test_checkpoint_state_across_resume(memory_checkpointer: MemorySaver):
     """
@@ -293,7 +293,7 @@ def test_checkpoint_state_across_resume(memory_checkpointer: MemorySaver):
     assert "completion" in agent_names
 
 
-# ── Test 8: Retry limits and initial state defaults ─────────────────
+# ΓöÇΓöÇ Test 8: Retry limits and initial state defaults ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 def test_retry_limits_and_initial_defaults():
     """Verify that initial state sets correct defaults for retry tracking."""
@@ -312,7 +312,7 @@ def test_retry_limits_and_initial_defaults():
     assert state["status"] == "pending"
 
 
-# ── Test 9: Model router integration ────────────────────────────────
+# ΓöÇΓöÇ Test 9: Model router integration ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 def test_model_router_tier_integration():
     """Verify that model_router appropriately routes agent tiers."""
