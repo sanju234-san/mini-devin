@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from app.agents.schemas import TriageClassification, TriageResult
+# Deferred to avoid circular import:
+#   guardrails.output_guardrails → agents.schemas → agents.__init__
+#   → agents.graph → agents.triage → guardrails (partially initialized)
+if TYPE_CHECKING:
+    from app.agents.schemas import TriageClassification, TriageResult
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +48,9 @@ def redact_secrets(text: str) -> str:
 def validate_triage_output(
     data: dict[str, Any],
     fallback_reason: str = "Triage validation failed; safely routed to out_of_scope.",
-) -> TriageResult:
+) -> "TriageResult":
+    # Local import prevents the circular dependency at module load time.
+    from app.agents.schemas import TriageClassification, TriageResult  # noqa: PLC0415
     """
     Validate a raw dictionary against TriageResult requirements.
     

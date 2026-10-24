@@ -15,14 +15,20 @@ import datetime
 import logging
 from typing import Any, Optional
 
+from langchain_core.runnables.config import RunnableConfig, var_child_runnable_config
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 from pydantic import ValidationError
 
 from app.agents.checkpointer import get_checkpointer
+from app.agents.coder import coder_node
+from app.agents.debugger import debugger_node
 from app.agents.planner import planner_node
+from app.agents.pr_agent import pr_node
 from app.agents.retrieval import retrieval_node
+from app.agents.reviewer import reviewer_node
+from app.agents.test_runner import test_runner_node
 from app.agents.routing import Limits, decide, make_router
 from app.agents.schemas import (
     AgentState,
@@ -97,7 +103,7 @@ def safe_stop_node(state: AgentState) -> dict[str, Any]:
     }
 
 
-def human_approval_node(state: AgentState) -> dict[str, Any]:
+def human_approval_node(state: AgentState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
     """
     Human Approval Node: Interrupts execution before any repository modifications.
     
@@ -140,8 +146,16 @@ def human_approval_node(state: AgentState) -> dict[str, Any]:
         "message": f"Human approval required to proceed with code modifications (Plan Hash: {plan_hash[:8]}).",
     }
 
-    # Execution yields here until resumed with Command(resume=...)
-    resume_payload = interrupt(approval_request)
+    # Ensure LangGraph runnable context is active across async and sync runtimes (Python < 3.11 contextvar propagation)
+    config_token = None
+    if config is not None:
+        config_token = var_child_runnable_config.set(config)
+    try:
+        # Execution yields here until resumed with Command(resume=...)
+        resume_payload = interrupt(approval_request)
+    finally:
+        if config_token is not None:
+            var_child_runnable_config.reset(config_token)
 
     # Normalize resume payload
     decision_value = "rejected"
@@ -242,7 +256,7 @@ def route_approval(state: AgentState) -> str:
     """Conditional router directing flow based on human approval decision."""
     approval = state.get("human_approval")
     if _get_approval_decision(approval) == "approved":
-        return "completion"
+        return "coder"
     return "rejection_terminal"
 
 
@@ -295,7 +309,79 @@ def completion_node(state: AgentState) -> dict[str, Any]:
     }
 
 
-# ΓöÇΓöÇ Graph Builder ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+def retry_limit_terminal_node(state: AgentState) -> dict[str, Any]:
+    """
+    Terminal node reached when test-and-debug retry attempts are exhausted.
+    
+    Halts execution safely without entering an infinite loop.
+    """
+    retry_count = state.get("retry_count", 0)
+    max_retries = state.get("max_retries", 3)
+    logger.warning("Retry limit reached (%d/%d). Halting workflow.", retry_count, max_retries)
+
+    event = create_event(
+        agent_name="retry_limit_terminal",
+        event_type="workflow_halted",
+        status="failed",
+        message=f"Maximum debug retry limit reached ({retry_count}/{max_retries}). Halting workflow safely.",
+        metadata={"retry_count": retry_count, "max_retries": max_retries},
+    )
+    return {
+        "status": "failed",
+        "current_agent": "retry_limit_terminal",
+        "events": [event],
+    }
+
+
+def route_test_runner(state: AgentState) -> str:
+    """
+    Conditional router directing flow after test runner execution:
+    - If tests pass (or no test failure recorded): proceed to reviewer
+    - If tests fail and retry attempts remain: loop to debugger -> coder -> test_runner
+    - If retry limit reached: halt at retry_limit_terminal
+    """
+    test_results = state.get("test_results")
+    passed = True
+    if test_results is not None:
+        if isinstance(test_results, dict):
+            passed = bool(test_results.get("passed", False))
+        elif hasattr(test_results, "passed"):
+            passed = bool(test_results.passed)
+    elif state.get("status") == "failed":
+        passed = False
+
+    if passed:
+        return "reviewer"
+
+    retry_count = state.get("retry_count", 0)
+    max_retries = state.get("max_retries", 3)
+    if retry_count < max_retries:
+        return "debugger"
+    return "retry_limit_terminal"
+
+
+def _is_review_approved(findings: Any) -> bool:
+    """Helper to check if review_findings explicitly contains an approved flag."""
+    if findings is None:
+        return False
+    if isinstance(findings, dict):
+        return bool(findings.get("approved", False))
+    return bool(getattr(findings, "approved", False))
+
+
+def route_reviewer(state: AgentState) -> str:
+    """
+    Conditional router directing flow after Reviewer execution:
+    - If review_findings explicitly approves the patch: proceed to pr_agent
+    - If review_findings is missing, incomplete, or not approved: halt execution safely at END
+    """
+    findings = state.get("review_findings")
+    if _is_review_approved(findings):
+        return "pr_agent"
+    return "end"
+
+
+# ── Graph Builder ─────────────────────────────────────────────────────────────
 
 def create_workflow_graph() -> StateGraph:
     """
@@ -314,7 +400,12 @@ def create_workflow_graph() -> StateGraph:
     builder.add_node("planner", planner_node)
     builder.add_node("human_approval", human_approval_node)
     builder.add_node("rejection_terminal", rejection_terminal_node)
-    builder.add_node("completion", completion_node)
+    builder.add_node("coder", coder_node)
+    builder.add_node("test_runner", test_runner_node)
+    builder.add_node("debugger", debugger_node)
+    builder.add_node("reviewer", reviewer_node)
+    builder.add_node("pr_agent", pr_node)
+    builder.add_node("retry_limit_terminal", retry_limit_terminal_node)
 
     # Add edges and routing
     builder.add_edge(START, "triage")
@@ -333,12 +424,32 @@ def create_workflow_graph() -> StateGraph:
         "human_approval",
         route_approval,
         {
-            "completion": "completion",
+            "coder": "coder",
             "rejection_terminal": "rejection_terminal",
         },
     )
     builder.add_edge("rejection_terminal", END)
-    builder.add_edge("completion", END)
+    builder.add_edge("coder", "test_runner")
+    builder.add_conditional_edges(
+        "test_runner",
+        route_test_runner,
+        {
+            "reviewer": "reviewer",
+            "debugger": "debugger",
+            "retry_limit_terminal": "retry_limit_terminal",
+        },
+    )
+    builder.add_edge("debugger", "coder")
+    builder.add_conditional_edges(
+        "reviewer",
+        route_reviewer,
+        {
+            "pr_agent": "pr_agent",
+            "end": END,
+        },
+    )
+    builder.add_edge("pr_agent", END)
+    builder.add_edge("retry_limit_terminal", END)
 
     return builder
 
@@ -363,7 +474,7 @@ REQUIRED_NODE_KEYS = frozenset({
 })
 
 
-def _legacy_human_approval(state: RunState, limits: Limits) -> dict:
+def _legacy_human_approval(state: RunState, limits: Limits, config: Optional[RunnableConfig] = None) -> dict:
     """Human-in-the-loop approval interrupt node for legacy supervisor graph."""
     plans = state.get("plan_versions", [])
     latest_plan = plans[-1] if plans else None
@@ -372,7 +483,14 @@ def _legacy_human_approval(state: RunState, limits: Limits) -> dict:
         "plan_version_id": latest_plan.version_id if latest_plan else None,
     }
 
-    raw = interrupt(payload)
+    config_token = None
+    if config is not None:
+        config_token = var_child_runnable_config.set(config)
+    try:
+        raw = interrupt(payload)
+    finally:
+        if config_token is not None:
+            var_child_runnable_config.reset(config_token)
 
     if isinstance(raw, ApprovalResponse):
         response = raw
@@ -496,7 +614,7 @@ def build_graph(
     for name, fn in nodes.items():
         graph.add_node(name, fn)
 
-    graph.add_node("human_approval", lambda state: _legacy_human_approval(state, limits))
+    graph.add_node("human_approval", lambda state, config=None: _legacy_human_approval(state, limits, config))
     graph.add_node("escalate", lambda state: _escalate(state, limits))
     graph.add_node("finish", _finish)
 
@@ -548,6 +666,14 @@ __all__ = [
     "safe_stop_node",
     "rejection_terminal_node",
     "completion_node",
+    "coder_node",
+    "test_runner_node",
+    "debugger_node",
+    "reviewer_node",
+    "pr_node",
+    "retry_limit_terminal_node",
     "route_triage",
     "route_approval",
+    "route_test_runner",
+    "route_reviewer",
 ]

@@ -8,6 +8,7 @@ plan approval/rejection with persistent checkpoints.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sys
@@ -127,6 +128,204 @@ def parse_issue_input(text: str) -> tuple[str, str, str, Optional[str], Optional
     return repo, title, body, None, None
 
 
+def build_plan_document(plan: Any, title: str = "", plan_hash: str = "") -> str:
+    """
+    Render an authentic, readable Markdown implementation plan document
+    for preview in Chainlit's right-side panel.
+    
+    Guarantees:
+    - Never displays raw structured JSON/dict text or standalone hashes as body content.
+    - Presents formatted hierarchical markdown headings (#, ##, ###).
+    - Details numbered implementation steps with action verbs and target file paths.
+    - Renders evidence citations, root-cause findings, and file modifications when present.
+    - Treats plan hash strictly as secondary provenance metadata in the document header.
+    """
+    if plan is None:
+        p: dict[str, Any] = {}
+    elif hasattr(plan, "model_dump"):
+        p = plan.model_dump(mode="json")
+    elif isinstance(plan, str):
+        raw_str = plan.strip()
+        if raw_str.startswith("{") and raw_str.endswith("}"):
+            try:
+                p = json.loads(raw_str)
+            except Exception:
+                p = {"explanation": raw_str}
+        elif raw_str.startswith("#"):
+            return raw_str
+        else:
+            p = {"explanation": raw_str}
+    elif isinstance(plan, dict):
+        p = dict(plan)
+    else:
+        p = {"explanation": str(plan)}
+
+    summary = p.get("summary") or p.get("intent") or title or "Engineering Implementation Plan"
+    version = p.get("plan_version") or p.get("version_id") or "v1"
+    phash = p.get("plan_hash") or plan_hash or ""
+    short_hash = phash[:8] if phash else "unfrozen"
+    complexity = str(p.get("estimated_complexity", "medium")).upper()
+    provenance = p.get("provenance", "evidence_grounded_synthesis")
+    explanation = p.get("explanation") or p.get("scope") or ""
+
+    sec_num = 1
+    lines: list[str] = [
+        f"# 📋 Implementation Plan: {summary}",
+        "",
+        f"> **Plan Version:** `{version}` | **Frozen Hash:** `{short_hash}` | **Estimated Complexity:** `{complexity}` | **Provenance:** `{provenance}`",
+        "",
+        f"## {sec_num}. Summary & Intended Behavior",
+        explanation if explanation else f"Evidence-grounded engineering plan for issue: {summary}.",
+        "",
+    ]
+    sec_num += 1
+
+    # Root Cause Analysis
+    rc = p.get("root_cause")
+    if rc and isinstance(rc, dict):
+        lines.append(f"## {sec_num}. Root Cause Analysis")
+        sec_num += 1
+        findings = rc.get("evidence_backed_findings", [])
+        if findings:
+            lines.append("### 🔍 Evidence-Supported Findings")
+            for f in findings:
+                lines.append(f"- {f}")
+        hypotheses = rc.get("hypotheses", [])
+        if hypotheses:
+            lines.append("### 💡 Hypotheses (Awaiting Further Evidence)")
+            for h in hypotheses:
+                lines.append(f"- {h}")
+        lines.append("")
+
+    # Grounded Code Evidence
+    evidence = p.get("evidence_items", [])
+    if evidence:
+        lines.append(f"## {sec_num}. Grounded Code Evidence")
+        sec_num += 1
+        for ev in evidence:
+            if isinstance(ev, dict):
+                fpath = ev.get("file_path", "")
+                sline = ev.get("start_line", 1)
+                eline = ev.get("end_line", 1)
+                sym = ev.get("symbol")
+                sym_str = f" (`{sym}`)" if sym else ""
+                obs = ev.get("observation", "")
+                lines.append(f"- `{fpath}:{sline}-{eline}`{sym_str}: {obs}")
+            else:
+                lines.append(f"- {ev}")
+        lines.append("")
+
+    # Proposed Changes by File
+    file_changes = p.get("file_changes", [])
+    if file_changes:
+        lines.append(f"## {sec_num}. Proposed Changes by File")
+        sec_num += 1
+        for fc in file_changes:
+            if isinstance(fc, dict):
+                fpath = fc.get("file_path", "unknown")
+                lines.append(f"### `{fpath}`")
+                if fc.get("module_or_function"):
+                    lines.append(f"- **Target Symbol:** `{fc.get('module_or_function')}`")
+                if fc.get("change_description"):
+                    lines.append(f"- **Change Description:** {fc.get('change_description')}")
+            else:
+                lines.append(f"- {fc}")
+        lines.append("")
+
+    # Implementation Steps
+    steps = p.get("steps", [])
+    if steps:
+        lines.append(f"## {sec_num}. Implementation Steps")
+        sec_num += 1
+        for idx, s in enumerate(steps, 1):
+            if isinstance(s, dict):
+                num = s.get("step_number", idx)
+                action = str(s.get("action", "modify")).upper()
+                target = s.get("target_file") or (s.get("files")[0] if s.get("files") else "repository")
+                desc = s.get("description", "")
+                lines.append(f"{num}. **[{action}]** `{target}`: {desc}")
+            else:
+                lines.append(f"{idx}. {s}")
+        lines.append("")
+
+    # Acceptance Criteria / Requirements
+    ac = p.get("acceptance_criteria") or []
+    reqs = p.get("requirements") or []
+    if ac or reqs:
+        lines.append(f"## {sec_num}. Acceptance Criteria")
+        sec_num += 1
+        for criterion in ac:
+            lines.append(f"- [ ] {criterion}")
+        for r in reqs:
+            if isinstance(r, dict):
+                r_desc = r.get("description") or r.get("acceptance_criterion", "")
+            else:
+                r_desc = getattr(r, "description", str(r))
+            lines.append(f"- [ ] {r_desc}")
+        lines.append("")
+
+    # Test Strategy
+    ts = p.get("test_strategy")
+    exp_tests = p.get("expected_tests") or []
+    if ts or exp_tests:
+        lines.append(f"## {sec_num}. Test Strategy")
+        sec_num += 1
+        if isinstance(ts, dict):
+            inspect_tests = ts.get("existing_tests_to_inspect", [])
+            if inspect_tests:
+                lines.append("### Existing Tests to Inspect")
+                for t in inspect_tests:
+                    lines.append(f"- `{t}`")
+            new_tests = ts.get("new_tests_to_add", [])
+            if new_tests:
+                lines.append("### New Tests to Add")
+                for t in new_tests:
+                    lines.append(f"- {t}")
+        for t in exp_tests:
+            lines.append(f"- Regression test: `{t}`")
+        lines.append("")
+
+    # Dependencies & Interfaces
+    deps = p.get("dependencies_and_interfaces", [])
+    if deps:
+        lines.append(f"## {sec_num}. Dependencies & Interfaces")
+        sec_num += 1
+        for d in deps:
+            lines.append(f"- {d}")
+        lines.append("")
+
+    # Security Considerations
+    sec = p.get("security_considerations", [])
+    if sec:
+        lines.append(f"## {sec_num}. Security & Guardrail Considerations")
+        sec_num += 1
+        for s in sec:
+            lines.append(f"- {s}")
+        lines.append("")
+
+    # Risks & Assumptions
+    risks = p.get("risks_and_assumptions", [])
+    if risks:
+        lines.append(f"## {sec_num}. Risks & Assumptions")
+        sec_num += 1
+        for r in risks:
+            lines.append(f"- {r}")
+        lines.append("")
+
+    # Verification Commands
+    cmds = p.get("suggested_verification_commands", [])
+    if cmds:
+        lines.append(f"## {sec_num}. Suggested Verification Commands")
+        sec_num += 1
+        lines.append("```bash")
+        for c in cmds:
+            lines.append(c)
+        lines.append("```")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
 @cl.on_chat_start
 async def on_chat_start():
     """Display welcome screen and instructions when a new session begins."""
@@ -201,8 +400,44 @@ async def on_message(message: cl.Message):
         state_values = current_state.values
         triage = state_values.get("triage") or {}
         retrieved = state_values.get("retrieved_context") or {}
-        plan = state_values.get("plan") or {}
         workflow_status = state_values.get("status", "")
+
+        # Extract authentic plan content (inspecting state values, then interrupt payload fallback)
+        plan_raw = state_values.get("plan")
+        if not plan_raw or (isinstance(plan_raw, str) and not plan_raw.strip().startswith("{")):
+            tasks = getattr(current_state, "tasks", [])
+            for t in tasks:
+                for intr in getattr(t, "interrupts", []):
+                    intr_val = getattr(intr, "value", None)
+                    if isinstance(intr_val, dict) and "plan" in intr_val:
+                        candidate_plan = intr_val["plan"]
+                        if candidate_plan and not isinstance(candidate_plan, str):
+                            plan_raw = candidate_plan
+                            break
+
+        # Normalize plan dictionary
+        plan_dict: dict[str, Any] = {}
+        if hasattr(plan_raw, "model_dump"):
+            plan_dict = plan_raw.model_dump(mode="json")
+        elif isinstance(plan_raw, dict):
+            plan_dict = dict(plan_raw)
+        elif isinstance(plan_raw, str) and plan_raw.strip().startswith("{"):
+            try:
+                plan_dict = json.loads(plan_raw)
+            except Exception:
+                plan_dict = {"explanation": plan_raw}
+
+        plan_version = (
+            plan_dict.get("plan_version")
+            or state_values.get("plan_version")
+            or "v1"
+        )
+        plan_hash = (
+            plan_dict.get("plan_hash")
+            or state_values.get("plan_hash")
+            or ""
+        )
+        short_hash = plan_hash[:8] if plan_hash else "unfrozen"
 
         # Handle Out-of-Scope or safe-stop termination
         if workflow_status == "out_of_scope" or not triage.get("is_supported", True):
@@ -240,45 +475,37 @@ async def on_message(message: cl.Message):
             )
         ).send()
 
-        # Format and display the Frozen Implementation Plan
-        plan_version = plan.get("plan_version", "v1")
-        plan_hash = plan.get("plan_hash", "")
-        short_hash = plan_hash[:8] if plan_hash else "unfrozen"
-        plan_markdown = format_plan_as_markdown(plan)
-
-        elements = []
-        side_panel_notice = ""
-        try:
-            plan_element = cl.Text(
-                name="implementation_plan.md",
-                content=plan_markdown,
-                display="side",
-                language="markdown",
-            )
-            elements.append(plan_element)
-            side_panel_notice = "👉 *The complete evidence-grounded engineering plan is open in the right-side preview panel (`implementation_plan.md`).*"
-        except Exception as elem_err:
-            logger.warning("Side panel element creation skipped: %s", elem_err)
-
-        # Summary card in main chat
-        steps_markdown = ""
-        for s in plan.get("steps", []):
-            steps_markdown += f"{s.get('step_number')}. **[{s.get('action', 'modify').upper()}]** `{s.get('target_file')}`: {s.get('description')}\n"
-
-        plan_display = (
-            f"### 📝 Proposed Implementation Plan (Frozen: `{plan_version}:{short_hash}`)\n\n"
-            f"**Summary:** {plan.get('summary', title)}\n\n"
-            f"**Analysis:** {plan.get('explanation', '')}\n\n"
-            f"**Estimated Complexity:** `{plan.get('estimated_complexity', 'medium').upper()}` | **Provenance:** `{plan.get('provenance', 'deterministic')}`\n\n"
-            f"**Planned Steps:**\n{steps_markdown}\n"
-            f"**Affected Files:** `{', '.join(plan.get('affected_files', [])) or 'None'}`\n\n"
-            f"{side_panel_notice}"
+        # Build readable document preview — rendered as markdown in a Message
+        plan_markdown = build_plan_document(
+            plan=plan_dict if plan_dict else plan_raw,
+            title=title,
+            plan_hash=plan_hash,
         )
 
-        if not elements:
-            plan_display += f"\n\n---\n{plan_markdown}"
+        # ── Right-side panel: plain-text sidebar for quick scrolling ────────────
+        # NOTE: cl.Text with language="markdown" renders as a code editor
+        # (syntax-highlighted source), NOT as formatted HTML. Omitting `language`
+        # gives a plain-text viewer. Fully rendered markdown is only possible
+        # via cl.Message content, which Chainlit always processes as markdown.
+        try:
+            plan_element = cl.Text(
+                name="implementation_plan",
+                content=plan_markdown,
+                display="side",
+                # language intentionally omitted — avoids code-editor rendering
+            )
+            await cl.ElementSidebar.set_title("📋 Implementation Plan")
+            await cl.ElementSidebar.set_elements([plan_element])
+        except Exception as elem_err:
+            logger.warning("Side panel element preview setup skipped: %s", elem_err)
 
-        await cl.Message(content=plan_display, elements=elements).send()
+        # ── Main chat: full rendered markdown preview ────────────────────────────
+        # cl.Message content is always rendered as formatted markdown by Chainlit,
+        # giving proper headings, bullet points, checklists, and code blocks.
+        await cl.Message(
+            author="📋 Implementation Plan",
+            content=plan_markdown,
+        ).send()
 
     except Exception as exc:
         logger.exception("Error executing initial workflow phase")
@@ -288,8 +515,8 @@ async def on_message(message: cl.Message):
     # Phase 2: Human Approval Interrupt & User Choice
     decision = "rejected"
     user_feedback = ""
-    frozen_hash = plan.get("plan_hash", "")
-    frozen_version = plan.get("plan_version", "v1")
+    frozen_hash = plan_hash
+    frozen_version = plan_version
 
     try:
         actions = [
