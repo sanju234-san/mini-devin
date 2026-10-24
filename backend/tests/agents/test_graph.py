@@ -14,6 +14,7 @@ Verifies:
 
 from __future__ import annotations
 
+import asyncio
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
@@ -745,74 +746,78 @@ def test_pydantic_review_findings_approved_reaches_pr_agent(memory_checkpointer:
 
 # ── Test 19 & 20: Async planning phase & RunnableConfig regression tests ─────
 
-@pytest.mark.asyncio
-async def test_async_workflow_planning_phase_with_github_issue_url(memory_checkpointer: MemorySaver):
+def test_async_workflow_planning_phase_with_github_issue_url(memory_checkpointer: MemorySaver):
     """
     Regression test for: Called get_config outside of a runnable context.
     Executes the workflow graph via graph.ainvoke() with a GitHub issue URL,
     verifying it cleanly executes Triage -> Retrieval -> Planner and pauses at
     human_approval without failing on missing RunnableConfig context.
     """
-    graph = create_graph(checkpointer=memory_checkpointer)
-    initial_state = create_initial_state(
-        repo="octocat/Hello-World",
-        issue_title="Fix defect reported in #42 for octocat/Hello-World",
-        issue_body="Automated bug report imported from https://github.com/octocat/Hello-World/issues/42.",
-        issue_url="https://github.com/octocat/Hello-World/issues/42",
-        issue_number=42,
-    )
-    thread_id = initial_state["thread_id"]
-    config = {"configurable": {"thread_id": thread_id}}
+    async def _test():
+        graph = create_graph(checkpointer=memory_checkpointer)
+        initial_state = create_initial_state(
+            repo="octocat/Hello-World",
+            issue_title="Fix defect reported in #42 for octocat/Hello-World",
+            issue_body="Automated bug report imported from https://github.com/octocat/Hello-World/issues/42.",
+            issue_url="https://github.com/octocat/Hello-World/issues/42",
+            issue_number=42,
+        )
+        thread_id = initial_state["thread_id"]
+        config = {"configurable": {"thread_id": thread_id}}
 
-    # Phase 1: ainvoke up to human_approval interrupt
-    res = await graph.ainvoke(initial_state, config=config)
-    assert "__interrupt__" in res
+        # Phase 1: ainvoke up to human_approval interrupt
+        res = await graph.ainvoke(initial_state, config=config)
+        assert "__interrupt__" in res
 
-    saved = graph.get_state(config)
-    assert saved.next == ("human_approval",)
-    assert saved.values["status"] == "awaiting_approval"
-    assert saved.values["plan"] is not None
-    plan_hash = saved.values["plan_hash"]
-    assert plan_hash is not None
+        saved = graph.get_state(config)
+        assert saved.next == ("human_approval",)
+        assert saved.values["status"] == "awaiting_approval"
+        assert saved.values["plan"] is not None
+        plan_hash = saved.values["plan_hash"]
+        assert plan_hash is not None
 
-    # Phase 2: ainvoke resume with approval
-    approval_payload = {
-        "decision": "approved",
-        "plan_hash": plan_hash,
-        "plan_version": "v1",
-    }
-    resume_res = await graph.ainvoke(Command(resume=approval_payload), config=config)
-    assert resume_res is not None
-    saved_after = graph.get_state(config)
-    assert saved_after.values["status"] in ("approved", "completed", "reviewing", "submitting_pr")
+        # Phase 2: ainvoke resume with approval
+        approval_payload = {
+            "decision": "approved",
+            "plan_hash": plan_hash,
+            "plan_version": "v1",
+        }
+        resume_res = await graph.ainvoke(Command(resume=approval_payload), config=config)
+        assert resume_res is not None
+        saved_after = graph.get_state(config)
+        assert saved_after.values["status"] in ("approved", "completed", "reviewing", "submitting_pr")
+
+    asyncio.run(_test())
 
 
-@pytest.mark.asyncio
-async def test_async_workflow_planning_phase_rejection(memory_checkpointer: MemorySaver):
+def test_async_workflow_planning_phase_rejection(memory_checkpointer: MemorySaver):
     """Verifies that async execution with rejection cleanly terminates."""
-    graph = create_graph(checkpointer=memory_checkpointer)
-    initial_state = create_initial_state(
-        repo="octocat/Hello-World",
-        issue_title="Feature request #99",
-        issue_body="Add new feature",
-        issue_url="https://github.com/octocat/Hello-World/issues/99",
-        issue_number=99,
-    )
-    thread_id = initial_state["thread_id"]
-    config = {"configurable": {"thread_id": thread_id}}
+    async def _test():
+        graph = create_graph(checkpointer=memory_checkpointer)
+        initial_state = create_initial_state(
+            repo="octocat/Hello-World",
+            issue_title="Feature request #99",
+            issue_body="Add new feature",
+            issue_url="https://github.com/octocat/Hello-World/issues/99",
+            issue_number=99,
+        )
+        thread_id = initial_state["thread_id"]
+        config = {"configurable": {"thread_id": thread_id}}
 
-    res = await graph.ainvoke(initial_state, config=config)
-    assert "__interrupt__" in res
+        res = await graph.ainvoke(initial_state, config=config)
+        assert "__interrupt__" in res
 
-    saved = graph.get_state(config)
-    assert saved.next == ("human_approval",)
+        saved = graph.get_state(config)
+        assert saved.next == ("human_approval",)
 
-    # Reject
-    resume_res = await graph.ainvoke(Command(resume={"decision": "rejected"}), config=config)
-    assert resume_res is not None
-    saved_after = graph.get_state(config)
-    assert saved_after.values["status"] == "rejected"
-    assert saved_after.next == ()
+        # Reject
+        resume_res = await graph.ainvoke(Command(resume={"decision": "rejected"}), config=config)
+        assert resume_res is not None
+        saved_after = graph.get_state(config)
+        assert saved_after.values["status"] == "rejected"
+        assert saved_after.next == ()
+
+    asyncio.run(_test())
 
 
 
