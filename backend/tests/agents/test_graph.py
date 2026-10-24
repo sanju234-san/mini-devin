@@ -41,6 +41,18 @@ def memory_checkpointer() -> MemorySaver:
     return create_checkpointer()
 
 
+@pytest.fixture(autouse=True)
+def mock_graph_triage_classifier(monkeypatch: pytest.MonkeyPatch):
+    """Monkeypatch triage classifier for graph execution tests."""
+    def _mock_classify(text: str) -> tuple[str, float]:
+        lower = text.lower()
+        if any(kw in lower for kw in ["cors", "rfc", "vitepress", "kubernetes", "won't fix"]):
+            return "out_of_scope", 0.95
+        return "bug_fix", 0.95
+
+    monkeypatch.setattr("app.agents.triage.agent.classify_with_confidence", _mock_classify)
+
+
 # ΓöÇΓöÇ Test 1: Graph execution to planner interrupt ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 def test_graph_executes_to_planner_interrupt(memory_checkpointer: MemorySaver):

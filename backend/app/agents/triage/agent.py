@@ -1,174 +1,50 @@
 """
 Triage Agent Implementation for Mini-Devin.
 
-Classifies incoming GitHub issues into 'bug', 'feature', 'test', or 'out_of_scope':
+Classifies incoming GitHub issues using trained classifier:
 1. Treats issue content as untrusted input using input guardrails (prompt injection & sanitization).
-2. Uses the shared LLM client if functional with graceful provider fallback.
-3. Provides a robust, clearly labeled deterministic classification fallback for local development.
-4. Validates structured outputs through output guardrails with secret redaction.
-5. Updates LangGraph workflow state without mutating unrelated fields.
+2. Cleans issue text using clean_issue_text().
+3. Uses trained ML classifier pipeline via classify_with_confidence() without LLM calls.
+4. Fails closed safely if model is missing, prediction fails, or confidence is below threshold.
+5. Emits structured state updates including cleaned_query for downstream Retrieval.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from typing import Any, Optional
 
 from app.agents.model_router import route
 from app.agents.schemas import (
     AgentState,
+    TriageCategory,
     TriageClassification,
     TriageResult,
     create_event,
 )
 from app.guardrails import (
-    redact_secrets,
     validate_and_sanitize_issue,
-    validate_triage_output,
 )
+from app.ml_models.triage_classifier import (
+    MIN_CONFIDENCE,
+    TriageModelNotFound,
+    TriagePredictionError,
+    classify_with_confidence,
+)
+from app.retrieval.query_transform import clean_issue_text
 
 logger = logging.getLogger(__name__)
 
-# Out-of-scope and non-actionable keyword patterns
-_OUT_OF_SCOPE_PHRASES = (
-    r"\bhow\s+(to|do\s+i|can\s+i|should\s+i)\b",
-    r"\bwhy\s+(does|is|are|do)\b",
-    r"\bwhat\s+is\b",
-    r"\bquestion\s*:",
-    r"\brfc\s*:",
-    r"\bdiscussion\s*:",
-    r"\bproposal\s*:",
-    r"\bhelp\s+wanted\b",
-    r"\bdocumentation\s+only\b",
-    r"\bwon'?t\s*fix\b",
-    r"\bduplicate\b",
-    r"\bspam\b",
-    r"\[out-of-scope\]",
-    r"\bout\s+of\s+scope\b",
-    r"\[invalid\]",
-)
-
-# Test-related issue keyword patterns
-_TEST_PHRASES = (
-    r"\b(add|write|update|fix|broken|flaky|flakey|failing)\s+([a-zA-Z0-9_-]+\s+)?tests?\b",
-    r"\btest\s+(suite|coverage|case|cases|runner|harness|failure|failures|regression)\b",
-    r"\bunit\s*tests?\b",
-    r"\bintegration\s*tests?\b",
-    r"\be2e\s*tests?\b",
-    r"\bpytest\b",
-    r"\bjest\b",
-    r"\bmock(ing|s)?\b",
-    r"\bfixture(s)?\b",
-)
-
-# Bug-related issue keyword patterns
-_BUG_PHRASES = (
-    r"\b(fix|fixes|fixing|fixed|bug|defect|crash|crashes|exception|exceptions|error|errors|fault|traceback|panic)\b",
-    r"\b(fails|failing|failed|failure|broken|breaks)\b",
-    r"\b(null\s*pointer|[a-zA-Z0-9_]*exception|keyerror|typeerror|valueerror|indexerror|zerodivisionerror)\b",
-    r"\b(infinite\s+loop|memory\s+leak|deadlock|race\s+condition|timeout)\b",
-    r"\b5\d{2}\s+(error|status|internal\s+server)\b",
-    r"\bunexpected\s+(behavior|result|output)\b",
-    r"\bregression\b",
-)
-
-# Feature-related issue keyword patterns
-_FEATURE_PHRASES = (
-    r"\b(add|implement|support|introduce|allow|enable|provide|rewrite|refactor|migrate)\s+(support\s+for|new|a\s+new)?\b",
-    r"\bfeature\s*(request)?\b",
-    r"\benhancement\b",
-    r"\bnew\s+(capability|option|feature|functionality|endpoint|api)\b",
-    r"\bupgrade\s+to\b",
-)
-
-_AMBIGUOUS_TITLES = frozenset({
-    "bug", "issue", "problem", "error", "fix", "help", "broken", "test",
-    "feature", "update", "question", "urgent", "todo",
-})
-
-
-def _classify_deterministically(
-    title: str,
-    body: str,
-    warnings: list[str],
-) -> TriageResult:
-    """
-    Deterministic rule-based classification fallback for local development.
-    
-    Clearly tagged as deterministic fallback in its rationale.
-    Does not assume certainty on ambiguous inputs.
-    """
-    full_text = f"{title}\n{body}".lower()
-
-    # 1. Check for explicit out-of-scope / non-actionable markers
-    for pat in _OUT_OF_SCOPE_PHRASES:
-        if re.search(pat, full_text, re.IGNORECASE):
-            return TriageResult(
-                classification=TriageClassification.OUT_OF_SCOPE,
-                is_supported=False,
-                confidence=0.95,
-                reason="Identified as out of scope or non-actionable query via deterministic analysis.",
-                warnings=warnings,
-            )
-
-    # 2. Check for overly ambiguous or low-information inputs
-    words = [w for w in re.split(r"\W+", title.lower()) if w]
-    if len(words) == 1 and words[0] in _AMBIGUOUS_TITLES and len(body.strip()) < 10:
-        ambiguous_warning = f"Ambiguous issue: '{title}' lacks sufficient context to safely determine actionable code changes."
-        warnings.append(ambiguous_warning)
-        return TriageResult(
-            classification=TriageClassification.OUT_OF_SCOPE,
-            is_supported=False,
-            confidence=0.35,
-            reason=ambiguous_warning,
-            warnings=warnings,
-        )
-
-    # 3. Check for test-focused issues
-    for pat in _TEST_PHRASES:
-        if re.search(pat, full_text, re.IGNORECASE):
-            return TriageResult(
-                classification=TriageClassification.TEST,
-                is_supported=True,
-                confidence=0.90,
-                reason="Classified as a test engineering issue (deterministic fallback).",
-                warnings=warnings,
-            )
-
-    # 4. Check for bug patterns
-    for pat in _BUG_PHRASES:
-        if re.search(pat, full_text, re.IGNORECASE):
-            return TriageResult(
-                classification=TriageClassification.BUG,
-                is_supported=True,
-                confidence=0.92,
-                reason="Classified as a software defect/bug report (deterministic fallback).",
-                warnings=warnings,
-            )
-
-    # 5. Check for feature patterns
-    for pat in _FEATURE_PHRASES:
-        if re.search(pat, full_text, re.IGNORECASE):
-            return TriageResult(
-                classification=TriageClassification.FEATURE,
-                is_supported=True,
-                confidence=0.88,
-                reason="Classified as a feature request or enhancement (deterministic fallback).",
-                warnings=warnings,
-            )
-
-    # 6. Fallback for unclassifiable / ambiguous requests: do NOT blindly classify as bug/feature
-    unclear_warning = "Issue content did not match recognizable bug, feature, or test patterns."
-    warnings.append(unclear_warning)
-    return TriageResult(
-        classification=TriageClassification.OUT_OF_SCOPE,
-        is_supported=False,
-        confidence=0.40,
-        reason="Unable to determine issue scope with acceptable confidence; requires operator clarification.",
-        warnings=warnings,
-    )
+# Map classifier labels to TriageClassification and legacy TriageCategory
+_LABEL_MAPPING: dict[str, tuple[TriageClassification, Optional[TriageCategory]]] = {
+    "bug_fix": (TriageClassification.BUG, TriageCategory.BUG_FIX),
+    "bug": (TriageClassification.BUG, TriageCategory.BUG_FIX),
+    "small_feature": (TriageClassification.FEATURE, TriageCategory.SMALL_FEATURE),
+    "feature": (TriageClassification.FEATURE, TriageCategory.SMALL_FEATURE),
+    "test_writing": (TriageClassification.TEST, TriageCategory.TEST_WRITING),
+    "test": (TriageClassification.TEST, TriageCategory.TEST_WRITING),
+    "out_of_scope": (TriageClassification.OUT_OF_SCOPE, TriageCategory.OUT_OF_SCOPE),
+}
 
 
 def classify_issue(
@@ -179,82 +55,120 @@ def classify_issue(
     issue_number: Optional[int] = None,
 ) -> tuple[TriageResult, str]:
     """
-    Core Triage classification engine.
+    Core Triage classification engine using trained classifier and input guardrails.
     
     Returns:
         tuple of (TriageResult, execution_method) where execution_method is
-        'llm_inference', 'deterministic_fallback', or 'input_guardrail'.
+        'classifier' or 'input_guardrail'.
     """
     clean_title, clean_body, warnings, is_suspicious = validate_and_sanitize_issue(title, body)
 
-    # Guardrail check: Prompt Injection or Suspicious Input
+    # 1. Guardrail check: Prompt Injection or Suspicious Input
     if is_suspicious:
+        cleaned_query = clean_issue_text(f"{clean_title}\n{clean_body}".strip())
         result = TriageResult(
             classification=TriageClassification.OUT_OF_SCOPE,
+            category=TriageCategory.OUT_OF_SCOPE,
             is_supported=False,
             confidence=1.0,
             reason="Input guardrail: suspicious system prompt injection attempt detected.",
             warnings=warnings,
+            cleaned_query=cleaned_query,
         )
         return result, "input_guardrail"
 
-    # Missing or empty title check
+    # 2. Missing or empty title check
     if not clean_title:
         result = TriageResult(
             classification=TriageClassification.UNSUPPORTED,
+            category=None,
             is_supported=False,
             confidence=1.0,
             reason="Issue title is missing or empty; cannot proceed.",
             warnings=warnings,
+            cleaned_query="",
         )
         return result, "input_guardrail"
 
-    # Try shared LLM completion client if available
-    llm_functional = False
+    # 3. Clean issue text
+    raw_text = f"{clean_title}\n{clean_body}".strip() if clean_body else clean_title
+    cleaned_query = clean_issue_text(raw_text)
+
+    # 4. Classify using trained classifier (no LLM, no regex guess)
     try:
-        from app.integrations.llm_provider_client import complete
-
-        prompt = (
-            "You are the Triage Agent for Mini-Devin.\n"
-            "Analyze this GitHub issue and classify it into one of: 'bug', 'feature', 'test', 'out_of_scope'.\n"
-            f"Repository: {repo}\n"
-            f"Title: {clean_title}\n"
-            f"Description: {clean_body}\n\n"
-            "Respond ONLY with a valid JSON object matching:\n"
-            "{\n"
-            '  "classification": "bug" | "feature" | "test" | "out_of_scope",\n'
-            '  "is_supported": true | false,\n'
-            '  "confidence": 0.0 - 1.0,\n'
-            '  "reason": "concise explanation",\n'
-            '  "warnings": ["any relevant warnings"]\n'
-            "}"
+        label, confidence = classify_with_confidence(cleaned_query)
+    except TriageModelNotFound as exc:
+        logger.warning("Triage model artifact not found: %s", exc)
+        result = TriageResult(
+            classification=TriageClassification.UNSUPPORTED,
+            category=None,
+            is_supported=False,
+            confidence=0.0,
+            reason=f"Triage model unavailable: {exc}",
+            warnings=warnings + [f"Triage model not found: {exc}"],
+            cleaned_query=cleaned_query,
         )
+        return result, "classifier"
+    except (TriagePredictionError, Exception) as exc:
+        logger.warning("Triage model prediction error: %s", exc)
+        result = TriageResult(
+            classification=TriageClassification.UNSUPPORTED,
+            category=None,
+            is_supported=False,
+            confidence=0.0,
+            reason=f"Triage prediction failed: {exc}",
+            warnings=warnings + [f"Triage prediction error: {exc}"],
+            cleaned_query=cleaned_query,
+        )
+        return result, "classifier"
 
-        response_text = complete(prompt, agent_name="triage")
-        if response_text and isinstance(response_text, str):
-            parsed = json.loads(response_text)
-            validated = validate_triage_output(parsed)
-            # Combine any input warnings with model warnings
-            all_warnings = warnings + validated.warnings
-            validated.warnings = all_warnings
-            return validated, "llm_inference"
-        llm_functional = True
-    except (NotImplementedError, ImportError):
-        logger.debug("Shared LLM client not implemented; utilizing deterministic fallback.")
-    except Exception as exc:
-        logger.warning("LLM triage completion failed: %s; falling back to deterministic classification.", exc)
-        warnings.append(f"LLM inference unavailable or timed out: {redact_secrets(str(exc))}")
+    mapping = _LABEL_MAPPING.get(label, (TriageClassification.OUT_OF_SCOPE, TriageCategory.OUT_OF_SCOPE))
+    classification, category = mapping
 
-    # Deterministic fallback
-    deterministic_result = _classify_deterministically(clean_title, clean_body, warnings)
-    return deterministic_result, "deterministic_fallback"
+    # 5. Out of scope routing
+    if classification == TriageClassification.OUT_OF_SCOPE:
+        result = TriageResult(
+            classification=TriageClassification.OUT_OF_SCOPE,
+            category=category,
+            is_supported=False,
+            confidence=confidence,
+            reason="Issue classified as out of scope by triage classifier.",
+            warnings=warnings,
+            cleaned_query=cleaned_query,
+        )
+        return result, "classifier"
+
+    # 6. Confidence threshold check: fail closed on uncertain predictions
+    if confidence < MIN_CONFIDENCE:
+        result = TriageResult(
+            classification=TriageClassification.UNSUPPORTED,
+            category=category,
+            is_supported=False,
+            confidence=confidence,
+            reason="triage_uncertain",
+            warnings=warnings + [f"Low classification confidence ({confidence:.2f} < {MIN_CONFIDENCE}); operator clarification required."],
+            cleaned_query=cleaned_query,
+        )
+        return result, "classifier"
+
+    # 7. Actionable supported issue
+    result = TriageResult(
+        classification=classification,
+        category=category,
+        is_supported=True,
+        confidence=confidence,
+        reason=f"Classified as {classification.value} with confidence {confidence:.2f} via trained classifier.",
+        warnings=warnings,
+        cleaned_query=cleaned_query,
+    )
+    return result, "classifier"
 
 
 def triage_node(state: AgentState) -> dict[str, Any]:
     """
     LangGraph Triage Agent Node.
     
-    Evaluates issue information, invokes the classification engine with guardrails,
+    Evaluates issue information, invokes the trained classifier engine with guardrails,
     and updates shared AgentState without mutating unrelated fields.
     """
     tier = route("triage")
@@ -283,19 +197,21 @@ def triage_node(state: AgentState) -> dict[str, Any]:
         agent_name="triage",
         event_type="triage_completed",
         status=status,
-        message=f"Triage classified issue as '{result.classification.value}' ({'supported' if result.is_supported else 'unsupported'}). {result.reason}",
+        message=f"Triage classified issue as '{result.classification.value if result.classification else 'unsupported'}' ({'supported' if result.is_supported else 'unsupported'}). {result.reason}",
         metadata={
             "tier": tier.value,
-            "classification": result.classification.value,
+            "classification": result.classification.value if result.classification else "unsupported",
             "is_supported": result.is_supported,
             "confidence": result.confidence,
             "method": method,
+            "model_name": "triage_classifier",
             "warnings": result.warnings,
         },
     )
 
     return {
         "triage": result.model_dump(mode="json"),
+        "cleaned_query": result.cleaned_query,
         "status": status,
         "current_agent": "triage",
         "events": [event],

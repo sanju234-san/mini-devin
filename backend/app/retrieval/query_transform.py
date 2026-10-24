@@ -36,6 +36,46 @@ _IMAGE_RE = re.compile(r"!\[[^\[\]]{0,300}\]\([^()\s]{0,500}\)")
 # Checkbox markers at the start of a line only; does not consume newline
 _CHECKBOX_RE = re.compile(r"^[ \t]*[-*][ \t]*\[[ xX]\][ \t]*", re.MULTILINE)
 
+# GitHub issue-template: ### heading lines (e.g. "### Initial Checks", "### Description")
+_TEMPLATE_HEADING_RE = re.compile(r"^[ \t]*###[^\n]*", re.MULTILINE)
+
+# Section names whose checked checklist items are boilerplate
+_BOILERPLATE_SECTIONS = re.compile(
+    r"(?:Initial\s+Checks?|Discussed\s+in|Affected\s+Components?|Before\s+you\s+begin)",
+    re.IGNORECASE,
+)
+
+# A checked checklist line (text captured)
+_CHECKED_LINE_RE = re.compile(r"^[ \t]*[-*][ \t]*\[[xX]\][ \t]*(.*)$")
+
+# Checked items starting with these phrases are template boilerplate anywhere
+_BOILERPLATE_PHRASE_RE = re.compile(
+    r"^(?:I\s+confirm|I\s+(?:have\s+)?searched|I\s+added\s+a\s+descriptive\s+title)",
+    re.IGNORECASE,
+)
+
+
+def _strip_template_blocks(text: str) -> str:
+    """Drop ### template headings and boilerplate checked checklist items.
+
+    Checked items are removed only inside boilerplate sections or when they start
+    with a known template phrase. All other checklist text is kept (marker only
+    is stripped later by _CHECKBOX_RE).
+    """
+    result: list[str] = []
+    in_boilerplate = False
+    for line in text.split("\n"):
+        if _TEMPLATE_HEADING_RE.match(line):
+            in_boilerplate = bool(_BOILERPLATE_SECTIONS.search(line))
+            result.append("")
+            continue
+        m = _CHECKED_LINE_RE.match(line)
+        if m and (in_boilerplate or _BOILERPLATE_PHRASE_RE.match(m.group(1))):
+            result.append("")
+            continue
+        result.append(line)
+    return "\n".join(result)
+
 # Inline code: single-backtick spans on one line of at most 300 characters
 _INLINE_RE = re.compile(r"`[^`\n]{0,300}`")
 
@@ -134,7 +174,9 @@ def clean_issue_text(text: str | None, max_chars: int = 4000) -> str:
             out = _IMAGE_RE.sub("", out)
             # Remove bare http/https URLs
             out = re.sub(r"https?://\S+", "", out)
-            # Strip checkbox markers only at start of line
+            # Strip issue-template headings and boilerplate checklist items
+            out = _strip_template_blocks(out)
+            # Strip remaining checkbox markers only at start of line
             out = _CHECKBOX_RE.sub("", out)
             # Remove category So (symbols/emoji) and Cf (invisible chars, directional overrides)
             if not out.isascii():
