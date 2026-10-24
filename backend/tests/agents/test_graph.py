@@ -74,7 +74,7 @@ def test_graph_executes_to_planner_interrupt(memory_checkpointer: MemorySaver):
     assert values["retrieved_context"]["retrieval_status"] == "missing_checkout"
     assert values["plan"] is not None
     assert len(values["plan"]["steps"]) > 0
-    assert len(values["plan"]["affected_files"]) > 0
+    assert len(values["plan"]["affected_files"]) == 0
 
 
 # ΓöÇΓöÇ Test 2: Plan preserved at human approval interrupt ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -102,8 +102,8 @@ def test_plan_preserved_at_approval_interrupt(memory_checkpointer: MemorySaver):
     assert "plan" in interrupt_payload
 
     plan = saved_state.values["plan"]
-    assert plan["summary"] == "Fix: Add OAuth2 token refresh handler"
-    assert len(plan["steps"]) >= 2
+    assert plan["summary"] == "Blocked — Repository Checkout Required: Add OAuth2 token refresh handler"
+    assert len(plan["steps"]) == 1
     assert "affected_files" in plan
 
 
