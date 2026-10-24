@@ -28,3 +28,78 @@
 {"text": "Please add load tests for the search endpoint using locust. It degrades under concurrent requests.", "label": "test_writing"}
 {"text": "Write unit tests for the password reset token generation and validation logic.", "label": "test_writing"}
 {"text": "Add tests for the multi-tenant data isolation logic. A missing test here could lead to data leaks.", "label": "test_writing"}
+{"text": "Add pytest coverage for the retry decorator; failure paths are untested.", "label": "test_writing"}
+{"text": "The config loader has no tests for missing keys or malformed YAML. Please add them.", "label": "test_writing"}
+{"text": "Write unit tests for parse_date covering leap years and timezone offsets.", "label": "test_writing"}
+{"text": "We need regression tests for the pagination bug fixed in the last release.", "label": "test_writing"}
+{"text": "Increase test coverage of the CLI argument parser, currently under 40 percent.", "label": "test_writing"}
+{"text": "Add tests for the cache eviction logic, especially when max size is zero.", "label": "test_writing"}
+{"text": "Missing tests for the websocket reconnect handler. Add a test with a mocked socket.", "label": "test_writing"}
+{"text": "Please add parametrized tests for the slugify helper with unicode input.", "label": "test_writing"}
+{"text": "Add integration tests for the file upload endpoint with oversized files.", "label": "test_writing"}
+{"text": "No tests exist for the rate limiter. Add tests for burst and steady traffic.", "label": "test_writing"}
+{"text": "Add a test that ensures the logger does not leak secrets into output.", "label": "test_writing"}
+{"text": "The serializer lacks tests for nested optional fields; add unit tests.", "label": "test_writing"}
+{"text": "Add tests for the retry-after header handling in the HTTP client.", "label": "test_writing"}
+{"text": "Create tests for the database migration helper using an in-memory sqlite.", "label": "test_writing"}
+{"text": "Add edge case tests for the CSV reader: empty file, only header, trailing comma.", "label": "test_writing"}
+{"text": "Tests are missing for the permission checker when the user has no roles.", "label": "test_writing"}
+{"text": "Add snapshot tests for the markdown renderer output.", "label": "test_writing"}
+{"text": "Write tests that cover the timeout path of the background worker.", "label": "test_writing"}
+{"text": "Add unit tests for the URL router, including trailing slash and query strings.", "label": "test_writing"}
+{"text": "Add test fixtures for the auth module and cover token expiry.", "label": "test_writing"}
+{"text": "The flaky test_queue_drain should be rewritten with deterministic timing and extra assertions.", "label": "test_writing"}
+{"text": "Add property-based tests for the sorting utility.", "label": "test_writing"}
+{"text": "Increase coverage for error handling in the plugin loader; add negative tests.", "label": "test_writing"}
+{"text": "Add tests verifying the deprecation warnings are raised for the old API.", "label": "test_writing"}
+{"text": "Add async tests for the event bus subscribe and unsubscribe methods.", "label": "test_writing"}
+{"text": "Refactor the entire backend from Flask to FastAPI and migrate all endpoints.", "label": "out_of_scope"}
+{"text": "Rewrite the project in Rust for performance.", "label": "out_of_scope"}
+{"text": "How do I install this package on Windows? I keep getting an error in pip.", "label": "out_of_scope"}
+{"text": "Question: what is the difference between the sync and async clients?", "label": "out_of_scope"}
+{"text": "Update the documentation homepage and fix the typos in the README.", "label": "out_of_scope"}
+{"text": "Redesign the architecture into microservices across multiple repositories.", "label": "out_of_scope"}
+{"text": "Can someone explain how the plugin system works? I am new to this.", "label": "out_of_scope"}
+{"text": "Migrate the monorepo build system from Make to Bazel.", "label": "out_of_scope"}
+{"text": "Add translations of the docs into Japanese, Spanish and French.", "label": "out_of_scope"}
+{"text": "Support Python, JavaScript and Go in a single unified SDK rewrite.", "label": "out_of_scope"}
+{"text": "Discussion: should we drop support for Python 3.8?", "label": "out_of_scope"}
+{"text": "Rename all modules and reorganize the package layout across the codebase.", "label": "out_of_scope"}
+{"text": "Proposal for a new governance model and release process for the project.", "label": "out_of_scope"}
+{"text": "Upgrade every dependency to the latest major version and rewrite the affected code.", "label": "out_of_scope"}
+{"text": "Is there a tutorial for deploying this to Kubernetes? Looking for guidance.", "label": "out_of_scope"}
+{"text": "Write a blog post announcing the new release.", "label": "out_of_scope"}
+{"text": "Replace the ORM across the whole application with raw SQL.", "label": "out_of_scope"}
+{"text": "Large refactor: split the core module into ten packages and update all imports.", "label": "out_of_scope"}
+{"text": "Help wanted: looking for a mentor to learn contributing to open source.", "label": "out_of_scope"}
+{"text": "Move the CI from Travis to GitHub Actions and redo the release pipeline for all repos.", "label": "out_of_scope"}
+{"text": "TypeError when calling parse() with None; expected a ValueError with a clear message.", "label": "bug_fix"}
+{"text": "App crashes on startup with KeyError when the config file has no database section.", "label": "bug_fix"}
+{"text": "Response headers are duplicated when middleware is added twice, causing a 500 error.", "label": "bug_fix"}
+{"text": "ZeroDivisionError in average() when the list is empty.", "label": "bug_fix"}
+{"text": "Pagination returns the last item twice when the page size equals the total count.", "label": "bug_fix"}
+{"text": "Json schema generation breaks for Optional fields that have a default value.", "label": "bug_fix"}
+{"text": "The retry loop never terminates when the server returns 503 with no Retry-After header.", "label": "bug_fix"}
+{"text": "Validation error message shows the wrong field name for nested models.", "label": "bug_fix"}
+{"text": "File handle is not closed after exception in read_chunks, causing a resource leak.", "label": "bug_fix"}
+{"text": "Timezone-aware datetimes are serialized without offset, leading to wrong times.", "label": "bug_fix"}
+{"text": "Setting cookie with samesite=None raises an exception on Python 3.11.", "label": "bug_fix"}
+{"text": "Query parameters with plus signs are decoded as spaces incorrectly.", "label": "bug_fix"}
+{"text": "The CLI exits with code 0 even when a command fails.", "label": "bug_fix"}
+{"text": "Unicode filenames break the zip export on Windows with UnicodeEncodeError.", "label": "bug_fix"}
+{"text": "Dependency injection fails when using Annotated with a default value.", "label": "bug_fix"}
+{"text": "Race condition in the cache causes stale reads under concurrent writes.", "label": "bug_fix"}
+{"text": "Off-by-one error in the date range filter excludes the last day.", "label": "bug_fix"}
+{"text": "The middleware swallows exceptions and returns an empty 200 response.", "label": "bug_fix"}
+{"text": "Memory leak in the websocket handler: connections are never removed from the set.", "label": "bug_fix"}
+{"text": "Environment variable parsing fails for values containing an equals sign.", "label": "bug_fix"}
+{"text": "Add a --verbose flag to the CLI that prints request details.", "label": "small_feature"}
+{"text": "Support a configurable timeout parameter in the HTTP client constructor.", "label": "small_feature"}
+{"text": "Add an optional max_retries argument to the download helper.", "label": "small_feature"}
+{"text": "Allow passing a custom User-Agent header through the session object.", "label": "small_feature"}
+{"text": "Add a to_dict method on the Result class.", "label": "small_feature"}
+{"text": "Provide a helper to read settings from a TOML file.", "label": "small_feature"}
+{"text": "Add support for a dry-run option in the deploy command.", "label": "small_feature"}
+{"text": "Add a new endpoint that returns the application version.", "label": "small_feature"}
+{"text": "Allow the logger to include a request id when one is set.", "label": "small_feature"}
+{"text": "Add an option to skip validation of unknown fields.", "label": "small_feature"}
