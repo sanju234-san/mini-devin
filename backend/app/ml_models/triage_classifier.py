@@ -10,6 +10,7 @@ import json
 import os
 
 VALID_CLASSES = frozenset({"bug_fix", "small_feature", "test_writing", "out_of_scope"})
+MIN_CONFIDENCE = 0.6
 
 ARTIFACTS_DIR = os.path.join(os.path.dirname(__file__), "artifacts")
 PIPELINE_PATH = os.path.join(ARTIFACTS_DIR, "triage_pipeline.joblib")
@@ -91,3 +92,32 @@ def classify(issue_text: str) -> str:
         )
 
     return category
+ 
+ 
+def classify_with_confidence(issue_text: str) -> tuple[str, float]:
+    """Return tuple of (label, confidence) using pipeline predict_proba (max probability)."""
+    pipeline = load_pipeline()
+    if hasattr(pipeline, "predict_proba"):
+        probas = pipeline.predict_proba([issue_text])
+        if len(probas) == 0 or len(probas[0]) == 0:
+            raise TriagePredictionError("Triage pipeline returned empty probabilities.")
+        proba = probas[0]
+        if hasattr(pipeline, "classes_"):
+            classes = list(pipeline.classes_)
+            best_idx = int(max(range(len(proba)), key=lambda i: proba[i]))
+            category = str(classes[best_idx])
+            confidence = float(proba[best_idx])
+        else:
+            category = classify(issue_text)
+            confidence = float(max(proba))
+    else:
+        category = classify(issue_text)
+        confidence = 1.0
+
+    if category not in VALID_CLASSES:
+        raise TriagePredictionError(
+            f"Triage pipeline returned unexpected class '{category}'. "
+            f"Expected one of: {sorted(VALID_CLASSES)}."
+        )
+
+    return category, confidence

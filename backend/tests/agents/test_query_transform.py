@@ -234,3 +234,89 @@ def test_timing_inputs_under_three_seconds(name, gen_input):
     clean_issue_text(payload)
     elapsed = time.perf_counter() - t0
     assert elapsed < 3.0, f"Input '{name}' took {elapsed:.3f}s (exceeded 3.0s limit)"
+
+
+# ---- GitHub Issue-Template Boilerplate Stripping ----
+
+def test_template_heading_lines_stripped():
+    """### heading lines (GitHub issue-template section labels) are removed entirely."""
+    text = "### Initial Checks\n\nThe parser crashes.\n\n### Description\n\nDetailed description here."
+    cleaned = clean_issue_text(text)
+    assert "### Initial Checks" not in cleaned
+    assert "### Description" not in cleaned
+    assert "The parser crashes." in cleaned
+    assert "Detailed description here." in cleaned
+
+
+def test_full_checklist_lines_stripped():
+    """Full - [x] / - [ ] checklist lines are removed."""
+    text = (
+        "### Initial Checks\n"
+        "\n"
+        "- [x] I confirm I am using Pydantic V2\n"
+        "- [x] I have searched for existing issues\n"
+        "- [ ] I have read the docs\n"
+        "\n"
+        "### Description\n"
+        "\n"
+        "The model_validate fails on nested generics."
+    )
+    cleaned = clean_issue_text(text)
+    assert "I confirm I am using Pydantic V2" not in cleaned
+    assert "I have searched for existing issues" not in cleaned
+    # Unchecked - [ ] items have their MARKER stripped, but text is kept (per _CHECKBOX_RE contract)
+    assert "I have read the docs" in cleaned
+    assert "model_validate fails on nested generics" in cleaned
+
+
+def test_template_h3_stripped_not_h2():
+    """Only h3 (###) headings are stripped; ## and # headings are untouched."""
+    text = "## Real Section\n\nContent here.\n\n### Template Label\n\nMore content."
+    cleaned = clean_issue_text(text)
+    assert "## Real Section" in cleaned
+    assert "### Template Label" not in cleaned
+    assert "Content here." in cleaned
+    assert "More content." in cleaned
+
+
+def test_realistic_pydantic_template_issue_cleaned():
+    """A realistic pydantic-style issue body has all boilerplate stripped but real description kept."""
+    body = (
+        "### Initial Checks\n"
+        "\n"
+        "- [x] I confirm that I am using Pydantic V2\n"
+        "- [x] I have searched GitHub for similar requests\n"
+        "\n"
+        "### Description\n"
+        "\n"
+        "When calling model_validate_json with strict=True, nested generics reject valid data.\n"
+        "\n"
+        "### Example Code\n"
+        "\n"
+        "### Affected Components\n"
+        "\n"
+        "- [x] Data validation parsing\n"
+        "- [ ] JSON Schema\n"
+    )
+    cleaned = clean_issue_text(body)
+    assert "### Initial Checks" not in cleaned
+    assert "### Description" not in cleaned
+    assert "### Example Code" not in cleaned
+    assert "### Affected Components" not in cleaned
+    assert "I confirm that I am using Pydantic V2" not in cleaned
+    assert "I have searched GitHub" not in cleaned
+    assert "Data validation parsing" not in cleaned
+    assert "model_validate_json" in cleaned
+    assert "strict=True" in cleaned
+    assert "nested generics reject valid data" in cleaned
+
+
+def test_timing_template_heading_large_input():
+    """Large input with many ### lines strips quickly (under 3 seconds)."""
+    payload = ("### Initial Checks\n- [x] I confirm something\n\nReal text here.\n") * 10_000
+    t0 = time.perf_counter()
+    result = clean_issue_text(payload)
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 3.0, f"Template stripping took {elapsed:.3f}s"
+    assert "Real text here." in result
+    assert "### Initial Checks" not in result

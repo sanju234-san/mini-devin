@@ -226,6 +226,7 @@ class AgentState(TypedDict, total=False):
     issue_number: Optional[int]
     issue_title: str
     issue_body: str
+    cleaned_query: Optional[str]
     
     # Workflow Stage Artifacts
     triage: Optional[TriageResult | dict[str, Any]]
