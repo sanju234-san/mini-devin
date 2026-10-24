@@ -67,7 +67,7 @@ def validate_and_sanitize_issue(
     if not clean_body:
         warnings.append("Issue description/body is empty; triage will rely solely on title.")
 
-    # Check for prompt injection patterns
+    # Check for prompt injection patterns — collect ALL matches, not just the first.
     combined = f"{clean_title}\n{clean_body}"
     for rx in _INJECTION_REGEXES:
         if rx.search(combined):
@@ -75,6 +75,5 @@ def validate_and_sanitize_issue(
             warning_msg = f"Potential prompt injection pattern detected: '{rx.pattern}'."
             warnings.append(warning_msg)
             logger.warning("Input guardrail triggered: %s", warning_msg)
-            break
 
     return clean_title, clean_body, warnings, is_suspicious
