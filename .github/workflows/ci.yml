@@ -10,5 +10,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r backend/requirements.txt
-      - run: pytest backend/tests
+      - run: pip install pytest -r backend/requirements.txt
+      - run: python -m pytest backend/tests -q
+        env:
+          PYTHONPATH: backend
