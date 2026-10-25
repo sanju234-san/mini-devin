@@ -17,6 +17,7 @@ import uvicorn
 # Setup paths
 base_dir = Path(__file__).resolve().parent
 os.environ.setdefault("CHAINLIT_APP_ROOT", str(base_dir))
+os.environ.setdefault("MINI_DEVIN_MIN_CONFIDENCE", "0.40")
 backend_dir = str(base_dir.parent / "backend")
 console_dir = str(base_dir)
 

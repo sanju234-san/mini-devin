@@ -53,6 +53,16 @@ def mock_graph_triage_classifier(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("app.agents.triage.agent.classify_with_confidence", _mock_classify)
 
 
+@pytest.fixture(autouse=True)
+def enable_opt_in_sandbox_for_graph_tests(monkeypatch: pytest.MonkeyPatch):
+    """Enable explicit opt-in host execution for graph pipeline unit tests."""
+    from app.config import get_settings
+    monkeypatch.setenv("ALLOW_UNSAFE_HOST_EXECUTION", "true")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
 # ΓöÇΓöÇ Test 1: Graph execution to planner interrupt ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 def test_graph_executes_to_planner_interrupt(memory_checkpointer: MemorySaver):

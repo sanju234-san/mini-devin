@@ -279,7 +279,9 @@ class QueryAnalysis(NamedTuple):
     expanded_query: str
     exact_identifiers: list[str]
     search_terms: list[str]
-    method: str  # "llm_expanded" or "deterministic_extraction"
+    method: str  # "hyde_dense", "llm_expanded", or "deterministic_extraction"
+    hypothetical_snippet: Optional[str] = None
+    query_vector: Optional[list[float]] = None
 
 
 def extract_identifiers(text: str) -> list[str]:
@@ -312,33 +314,58 @@ def extract_keywords(text: str) -> list[str]:
     return keywords
 
 
+def generate_hyde_code(title: str, body: str = "") -> Optional[str]:
+    """
+    Generate a hypothetical code snippet solving the issue for HyDE retrieval.
+    
+    Prompts the model to synthesize a realistic candidate code fix, which is
+    subsequently embedded into dense vector space to retrieve analogous code chunks.
+    """
+    try:
+        from app.agents import model_router
+        prompt = (
+            f"You are a coding agent. Given this technical issue, produce a concise, "
+            f"hypothetical code implementation or function patch that resolves it. "
+            f"Output ONLY executable code:\n\n"
+            f"Title: {title}\n"
+            f"Details: {body}\n\n"
+            f"Code:"
+        )
+        response = model_router.complete(prompt, agent_name="retrieval")
+        if response and isinstance(response, str) and len(response.strip()) > 15:
+            return response.strip()
+    except Exception as exc:
+        logger.debug("HyDE snippet synthesis fell back to deterministic analysis: %s", exc)
+    return None
+
+
 def try_llm_expand(query: str) -> Optional[str]:
     """
     Attempt to use the shared LLM client to expand code query terms.
 
-    Returns None if the LLM client is unavailable, raising NotImplementedError,
-    or failing.
+    Returns None if the LLM client is unavailable or fails.
     """
     try:
-        from app.integrations.llm_provider_client import complete
+        from app.agents import model_router
         prompt = (
             f"Given this programming issue, provide 3 to 5 candidate file paths, "
             f"function names, or symbols to search for in the repository:\n\n{query}\n\n"
             f"Symbols:"
         )
-        response = complete(prompt, agent_name="retrieval")
+        response = model_router.complete(prompt, agent_name="retrieval")
         if response and isinstance(response, str):
             return response.strip()
-    except (NotImplementedError, ImportError, Exception) as exc:
+    except Exception as exc:
         logger.debug("LLM query expansion skipped (provider unavailable: %s)", exc)
     return None
 
 
-def transform_query(title: str, body: str = "") -> QueryAnalysis:
+def transform_query(title: str, body: str = "", enable_hyde: bool = True) -> QueryAnalysis:
     """
-    Produce structured query search terms from issue title and body.
+    Produce structured query search terms and HyDE dense embeddings from issue.
 
-    Combines exact identifier detection, keyword extraction, and optional LLM expansion.
+    Combines deterministic identifier detection, keyword extraction, and
+    Hypothetical Document Embeddings (HyDE) dense vector generation.
     """
     combined = f"{title.strip()}\n{body.strip()}".strip()
     if not combined:
@@ -348,13 +375,14 @@ def transform_query(title: str, body: str = "") -> QueryAnalysis:
             exact_identifiers=[],
             search_terms=[],
             method="deterministic_extraction",
+            hypothetical_snippet=None,
+            query_vector=None,
         )
 
-    # Deterministic extraction
+    # 1. Deterministic extraction (identifiers + keywords)
     identifiers = extract_identifiers(combined)
     keywords = extract_keywords(combined)
 
-    # Combine identifiers and keywords, prioritizing identifiers
     search_terms: list[str] = []
     seen: set[str] = set()
     for item in identifiers + keywords:
@@ -363,19 +391,40 @@ def transform_query(title: str, body: str = "") -> QueryAnalysis:
             seen.add(item_lower)
             search_terms.append(item)
 
-    # Optional LLM expansion
-    llm_expansion = try_llm_expand(title)
-    if llm_expansion:
-        method = "llm_expanded"
-        expanded = f"{combined}\n{llm_expansion}"
-        extra_kws = extract_keywords(llm_expansion)
-        for kw in extra_kws:
-            if kw.lower() not in seen:
-                seen.add(kw.lower())
-                search_terms.append(kw)
-    else:
-        method = "deterministic_extraction"
-        expanded = combined
+    # 2. HyDE (Hypothetical Document Embedding) Attempt
+    hypothetical_snippet = None
+    query_vector = None
+    method = "deterministic_extraction"
+
+    if enable_hyde:
+        hypothetical_snippet = generate_hyde_code(title, body)
+        if hypothetical_snippet:
+            try:
+                from app.ml_models.embedding_model import embed, is_embedding_available
+                if is_embedding_available():
+                    vectors = embed([hypothetical_snippet])
+                    if vectors and len(vectors) > 0:
+                        query_vector = vectors[0]
+                        method = "hyde_dense"
+                if method != "hyde_dense":
+                    method = "llm_expanded"
+            except Exception as e:
+                logger.debug("Embedding hypothetical snippet fell back: %s", e)
+                method = "llm_expanded"
+
+    # 3. Fallback / complementary symbol expansion if HyDE was not generated
+    if not hypothetical_snippet:
+        llm_expansion = try_llm_expand(title)
+        if llm_expansion:
+            method = "llm_expanded"
+            combined = f"{combined}\n{llm_expansion}"
+            extra_kws = extract_keywords(llm_expansion)
+            for kw in extra_kws:
+                if kw.lower() not in seen:
+                    seen.add(kw.lower())
+                    search_terms.append(kw)
+
+    expanded = f"{combined}\n{hypothetical_snippet}" if hypothetical_snippet else combined
 
     return QueryAnalysis(
         raw_query=combined,
@@ -383,4 +432,6 @@ def transform_query(title: str, body: str = "") -> QueryAnalysis:
         exact_identifiers=identifiers,
         search_terms=search_terms,
         method=method,
+        hypothetical_snippet=hypothetical_snippet,
+        query_vector=query_vector,
     )

@@ -82,6 +82,7 @@ from langgraph.types import Command
 from app.agents.checkpointer import get_checkpointer
 from app.agents.graph import create_graph
 from app.agents.schemas import create_initial_state, format_plan_as_markdown
+from app.integrations.issue_intake import process_issue_intake
 
 logger = logging.getLogger(__name__)
 
@@ -354,9 +355,22 @@ async def on_message(message: cl.Message):
         await cl.Message(content="⚠️ Please provide a GitHub issue URL or issue title.").send()
         return
 
-    # Parse and validate issue details
+    # Parse and validate issue details via genuine MCP intake service
     try:
-        repo, title, body, issue_url, issue_number = parse_issue_input(user_input)
+        async with cl.Step(name="Issue Intake & Validation", type="tool") as intake_step:
+            intake_step.output = "Validating input and fetching issue details via GitHub MCP..."
+            intake_res = await process_issue_intake(user_input)
+            intake_step.output = (
+                f"Successfully ingested issue #{intake_res.issue_number or 'free-text'} "
+                f"for `{intake_res.repo}`: {intake_res.issue_title}"
+            )
+
+        repo = intake_res.repo
+        title = intake_res.issue_title
+        body = intake_res.issue_body
+        issue_url = intake_res.issue_url
+        issue_number = intake_res.issue_number
+
         run_id = f"run_{uuid.uuid4().hex[:10]}"
         thread_id = f"thread_{uuid.uuid4().hex[:10]}"
 
@@ -366,12 +380,16 @@ async def on_message(message: cl.Message):
             issue_body=body,
             issue_url=issue_url,
             issue_number=issue_number,
+            repo_ref=intake_res.repo_ref,
+            commit_sha=intake_res.commit_sha,
+            snapshot_path=intake_res.snapshot_path,
+            issue_metadata=intake_res.issue_metadata,
             run_id=run_id,
             thread_id=thread_id,
         )
     except Exception as exc:
-        logger.exception("Input validation error")
-        await cl.Message(content=f"❌ **Validation Error:** {exc}").send()
+        logger.warning("Issue intake halted before triage: %s", exc)
+        await cl.Message(content=f"❌ **Intake Error:** {exc}").send()
         return
 
     config = {"configurable": {"thread_id": thread_id}}
@@ -576,9 +594,9 @@ async def on_message(message: cl.Message):
         error_detail = final_result.get("error")
 
         if decision == "approved":
-            if final_status == "pr_opened":
-                msg_title = "🎉 **Pull Request Created Successfully**"
-                handoff_text = f"- **PR Link / Artifacts:** `{final_result.get('pull_request_url', 'created')}`"
+            if final_status in ("pr_opened", "submitting_pr"):
+                msg_title = "🎉 **Pull Request Created / Prepared Successfully**"
+                handoff_text = f"- **PR Link / Artifacts:** `{final_result.get('pull_request_url', 'ready')}`"
             elif final_status == "failed":
                 msg_title = "⚠️ **Plan Approved, but Downstream Execution Halted**"
                 handoff_text = f"- **Halt Reason:** {error_detail or 'Downstream sandbox or review verification incomplete.'}"

@@ -40,7 +40,7 @@ def get_or_create_indexer(repo_path: Path) -> RepositoryIndexer:
 def retrieval_node(state: AgentState) -> dict[str, Any]:
     """
     Retrieval Agent Node: Locates real repository code context.
-    
+
     Validates repository location, scans and chunks authentic repository files,
     extracts query keywords/identifiers, and returns genuine evidence.
     If repository checkout is not available, reports a truthful structured
@@ -51,10 +51,16 @@ def retrieval_node(state: AgentState) -> dict[str, Any]:
     body = state.get("issue_body", "")
     repo_raw = state.get("repo", "")
 
+    # Context budgeting config
+    char_budget = 30000
+
     logger.info("Executing Retrieval node [tier=%s] for repo='%s'", tier, repo_raw)
 
-    # 1. Resolve local repository directory safely
-    repo_dir = resolve_permitted_repo_path(repo_raw)
+    # 1. Resolve local repository or snapshot directory safely
+    snapshot_path = state.get("snapshot_path")
+    repo_dir = resolve_permitted_repo_path(snapshot_path) if snapshot_path else None
+    if repo_dir is None:
+        repo_dir = resolve_permitted_repo_path(repo_raw)
 
     if repo_dir is None:
         # Truthful handling when repository checkout is not available locally
@@ -74,6 +80,8 @@ def retrieval_node(state: AgentState) -> dict[str, Any]:
             retrieval_status="missing_checkout",
             retrieval_method="none",
             error_message=f"Local repository checkout not found for '{repo_raw}'.",
+            char_budget=char_budget,
+            chars_used=0,
         )
         event = create_event(
             agent_name="retrieval",
@@ -111,6 +119,8 @@ def retrieval_node(state: AgentState) -> dict[str, Any]:
             retrieval_status="indexing_failed",
             retrieval_method=indexer.index.method_name,
             error_message=str(exc),
+            char_budget=char_budget,
+            chars_used=0,
         )
         event = create_event(
             agent_name="retrieval",
@@ -140,6 +150,8 @@ def retrieval_node(state: AgentState) -> dict[str, Any]:
             is_mock=False,
             retrieval_status="no_results",
             retrieval_method=indexer.index.method_name,
+            char_budget=char_budget,
+            chars_used=0,
         )
         event = create_event(
             agent_name="retrieval",
@@ -162,13 +174,15 @@ def retrieval_node(state: AgentState) -> dict[str, Any]:
         }
 
     # 3. Transform query into search terms
-    query_info = transform_query(title=title, body=body)
+    cleaned_query = state.get("cleaned_query", "")
+    query_info = transform_query(title=cleaned_query, body="")
 
-    # 4. Search index for genuine snippets
+    # 4. Search index for genuine snippets (dense HyDE vector if available, plus BM25 keywords)
     search_results = indexer.search(
         query=query_info.expanded_query,
         query_terms=query_info.search_terms,
         top_k=5,
+        query_vector=query_info.query_vector,
     )
 
     if not search_results:
@@ -179,6 +193,8 @@ def retrieval_node(state: AgentState) -> dict[str, Any]:
             is_mock=False,
             retrieval_status="no_results",
             retrieval_method=indexer.index.method_name,
+            char_budget=char_budget,
+            chars_used=0,
         )
         event = create_event(
             agent_name="retrieval",
@@ -200,32 +216,74 @@ def retrieval_node(state: AgentState) -> dict[str, Any]:
             "events": [event],
         }
 
-    # 5. Build authentic retrieved evidence
-    snippets = [
-        RetrievedSnippet(
-            file_path=r.file_path,
-            start_line=r.start_line,
-            end_line=r.end_line,
-            content=r.content,
-            score=r.score,
-            score_type=r.score_type,
-        )
-        for r in search_results
-    ]
+    # 5. Build authentic retrieved evidence with context budgeting
+    final_snippets: list[RetrievedSnippet] = []
+    current_chars = 0
+    is_truncated = False
+    is_omitted = False
 
-    # Deduplicate candidate files while preserving rank order
-    candidate_files = list(dict.fromkeys(r.file_path for r in search_results))
+    for i, r in enumerate(search_results):
+        content = r.content
+        content_len = len(content)
+
+        if current_chars + content_len <= char_budget:
+            # Fits perfectly
+            final_snippets.append(
+                RetrievedSnippet(
+                    file_path=r.file_path,
+                    start_line=r.start_line,
+                    end_line=r.end_line,
+                    content=content,
+                    score=r.score,
+                    score_type=r.score_type,
+                )
+            )
+            current_chars += content_len
+        else:
+            # Does not fit
+            is_omitted = True
+            if i == 0:
+                # First snippet is oversized: truncate it to fill the budget
+                truncated_content = content[:char_budget]
+                final_snippets.append(
+                    RetrievedSnippet(
+                        file_path=r.file_path,
+                        start_line=r.start_line,
+                        end_line=r.end_line,
+                        content=truncated_content,
+                        score=r.score,
+                        score_type=r.score_type,
+                    )
+                )
+                current_chars = len(truncated_content)
+                is_truncated = True
+            else:
+                # Later snippet: skip it
+                continue
+
+    # Deduplicate candidate files from the final (budgeted) list while preserving rank order
+    candidate_files = list(dict.fromkeys(s.file_path for s in final_snippets))
+
+    summary_text = (
+        f"Retrieved {len(final_snippets)} snippets across {len(candidate_files)} files "
+        f"via {indexer.index.method_name}. "
+        f"Budget: {char_budget}, Used: {current_chars}."
+    )
+    if state.get("snapshot_truncated"):
+        reason = state.get("snapshot_truncation_reason", "limit_exceeded")
+        summary_text += f" [WARNING: Repository snapshot was truncated ({reason}); search executed on partial codebase.]"
 
     retrieved = RetrievedContext(
         files=candidate_files,
-        snippets=snippets,
-        summary=(
-            f"Retrieved {len(snippets)} snippets across {len(candidate_files)} files "
-            f"via {indexer.index.method_name}."
-        ),
+        snippets=final_snippets,
+        summary=summary_text,
         is_mock=False,
         retrieval_status="success",
         retrieval_method=indexer.index.method_name,
+        char_budget=char_budget,
+        chars_used=current_chars,
+        is_truncated=is_truncated,
+        is_omitted=is_omitted,
     )
 
     event = create_event(
@@ -239,7 +297,10 @@ def retrieval_node(state: AgentState) -> dict[str, Any]:
             "retrieval_status": "success",
             "retrieval_method": indexer.index.method_name,
             "files": candidate_files,
-            "snippet_count": len(snippets),
+            "snippet_count": len(final_snippets),
+            "chars_used": current_chars,
+            "is_truncated": is_truncated,
+            "is_omitted": is_omitted,
         },
     )
 

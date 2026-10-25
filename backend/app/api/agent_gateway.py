@@ -47,11 +47,47 @@ class NoOpAgentGateway:
     """
 
     async def start_run(self, run_id: UUID, issue: IssueIn) -> None:
-        # Logging hygiene: logs contain only run_id, no issue contents or repos
         logger.info(
             "NoOpAgentGateway: No agent layer wired. Run %s remains queued.",
             run_id,
         )
+
+
+class LangGraphAgentGateway:
+    """Active Agent Gateway that executes the Mini-Devin LangGraph multi-agent workflow."""
+
+    def __init__(self, checkpointer=None):
+        self._checkpointer = checkpointer
+
+    async def start_run(self, run_id: UUID, issue: IssueIn) -> None:
+        from app.agents.checkpointer import get_checkpointer
+        from app.agents.graph import create_graph
+        from app.agents.schemas import create_initial_state
+
+        run_id_str = str(run_id)
+        thread_id = run_id_str
+        checkpointer = self._checkpointer or get_checkpointer()
+
+        owner = issue.repo.owner if hasattr(issue.repo, "owner") else "unknown"
+        name = issue.repo.name if hasattr(issue.repo, "name") else "repo"
+        repo = f"{owner}/{name}"
+
+        initial_state = create_initial_state(
+            repo=repo,
+            issue_title=issue.title,
+            issue_body=issue.body,
+            run_id=run_id_str,
+            thread_id=thread_id,
+        )
+
+        graph = create_graph(checkpointer=checkpointer)
+        config = {"configurable": {"thread_id": thread_id}}
+
+        logger.info("LangGraphAgentGateway: Launching workflow for run %s (%s)", run_id_str, repo)
+        # Execute workflow up to human approval interrupt
+        await graph.ainvoke(initial_state, config=config)
+        logger.info("LangGraphAgentGateway: Run %s execution paused at approval interrupt or completed", run_id_str)
+
 
 
 class EmptyMetricsProvider:

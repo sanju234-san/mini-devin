@@ -78,6 +78,11 @@ class RetrievedContext(BaseModel):
     retrieval_status: str = "success"  # "success", "no_results", "missing_checkout", "indexing_failed"
     retrieval_method: str = "none"  # "faiss_embedding", "lexical_bm25", "none"
     error_message: Optional[str] = None
+    # Context Budgeting Metadata
+    char_budget: Optional[int] = None
+    chars_used: int = 0
+    is_truncated: bool = False
+    is_omitted: bool = False
 
 
 # ΓöÇΓöÇ Planner Schemas ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -133,6 +138,8 @@ class ImplementationPlan(BaseModel):
     file_changes: list[dict[str, Any]] = Field(default_factory=list)
     dependencies_and_interfaces: list[str] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(default_factory=list)
+    non_goals: list[str] = Field(default_factory=list)
+    requirements: list[dict[str, Any]] = Field(default_factory=list)
     test_strategy: dict[str, Any] = Field(default_factory=dict)
     security_considerations: list[str] = Field(default_factory=list)
     risks_and_assumptions: list[str] = Field(default_factory=list)
@@ -203,18 +210,32 @@ class PatchMetadata(BaseModel):
 
 class TestResults(BaseModel):
     """Sandbox verification test run results."""
+    __test__ = False
     passed: bool
     total_tests: int = 0
     passed_tests: int = 0
     failed_tests: int = 0
+    skipped_tests: int = 0
     details: str = ""
+    exit_code: Optional[int] = 0
+    stdout: str = ""
+    stderr: str = ""
+    duration_seconds: float = 0.0
+    command: str = ""
+    infrastructure_failure: bool = False
+    timed_out: bool = False
+    sandbox_unavailable: bool = False
 
 
 class ReviewFindings(BaseModel):
     """Automated reviewer findings comparing diff to the approved plan."""
-    approved: bool
+    approved: bool = True
     score: float = Field(default=1.0, ge=0.0, le=1.0)
     comments: list[str] = Field(default_factory=list)
+    verdict: str = "approve"  # "approve", "revise", "block"
+    dimensions: dict[str, Any] = Field(default_factory=dict)
+    revision_instructions: list[str] = Field(default_factory=list)
+    linter_output: Optional[dict[str, Any]] = None
 
 
 # ΓöÇΓöÇ LangGraph Workflow State ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -237,6 +258,12 @@ class AgentState(TypedDict, total=False):
     issue_title: str
     issue_body: str
     cleaned_query: Optional[str]
+    repo_ref: Optional[str]
+    commit_sha: Optional[str]
+    snapshot_path: Optional[str]
+    snapshot_truncated: bool
+    snapshot_truncation_reason: Optional[str]
+    issue_metadata: Optional[dict[str, Any]]
     
     # Workflow Stage Artifacts
     triage: Optional[TriageResult | dict[str, Any]]
@@ -250,11 +277,16 @@ class AgentState(TypedDict, total=False):
     # Retry & Loop Limits
     retry_count: int
     max_retries: int
+    review_revisions: int
+    max_review_revisions: int
     
     # Downstream Stage Metadata (populated in subsequent stages)
     code_changes: Optional[list[PatchMetadata | dict[str, Any]]]
+    deviation_log: Optional[list[dict[str, Any]]]
     test_results: Optional[TestResults | dict[str, Any]]
+    linter_results: Optional[dict[str, Any]]
     review_findings: Optional[ReviewFindings | dict[str, Any]]
+    pull_request_package: Optional[dict[str, Any]]
 
     # Browser Testing Extension (optional; set by caller to enable Playwright runs)
     # browser_test_url  – explicit permitted URL to run browser scenarios against.
@@ -452,6 +484,10 @@ def create_initial_state(
     repo: str = "local/repo",
     issue_url: Optional[str] = None,
     issue_number: Optional[int] = None,
+    repo_ref: Optional[str] = None,
+    commit_sha: Optional[str] = None,
+    snapshot_path: Optional[str] = None,
+    issue_metadata: Optional[dict[str, Any]] = None,
     run_id: Optional[str] = None,
     thread_id: Optional[str] = None,
     max_retries: int = 3,
@@ -475,7 +511,13 @@ def create_initial_state(
         event_type="workflow_started",
         status="pending",
         message=f"Initialized workflow for {repo} (run_id: {active_run_id})",
-        metadata={"repo": repo, "issue_title": issue_title, "issue_number": issue_number},
+        metadata={
+            "repo": repo,
+            "issue_title": issue_title,
+            "issue_number": issue_number,
+            "commit_sha": commit_sha,
+            "snapshot_path": snapshot_path,
+        },
     )
 
     return {
@@ -486,6 +528,12 @@ def create_initial_state(
         "issue_number": issue_number,
         "issue_title": issue_title.strip(),
         "issue_body": issue_body.strip() if issue_body else "",
+        "repo_ref": repo_ref,
+        "commit_sha": commit_sha,
+        "snapshot_path": snapshot_path,
+        "snapshot_truncated": False,
+        "snapshot_truncation_reason": None,
+        "issue_metadata": issue_metadata,
         "triage": None,
         "retrieved_context": None,
         "plan": None,
@@ -494,9 +542,14 @@ def create_initial_state(
         "human_approval": None,
         "retry_count": 0,
         "max_retries": max_retries,
+        "review_revisions": 0,
+        "max_review_revisions": 2,
         "code_changes": None,
+        "deviation_log": [],
         "test_results": None,
+        "linter_results": None,
         "review_findings": None,
+        "pull_request_package": None,
         "status": "pending",
         "current_agent": None,
         "error": None,
@@ -664,9 +717,25 @@ class ApprovalResponse(BaseSchema):
 class FileChange(BaseSchema):
     """Individual file modification within a diff."""
     path: str
-    change_type: ChangeType
-    diff_text: str
-    requirement_ids: list[str]
+    change_type: ChangeType = ChangeType.MODIFY
+    diff_text: str = ""
+    requirement_ids: list[str] = Field(default_factory=list)
+
+    @property
+    def diff(self) -> str:
+        return self.diff_text
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_diff_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "diff" in data and "diff_text" not in data:
+                data["diff_text"] = data.pop("diff")
+            elif "diff" in data:
+                data.pop("diff")
+            if "change_type" not in data:
+                data["change_type"] = ChangeType.MODIFY
+        return data
 
     @model_validator(mode="after")
     def validate_requirements(self) -> "FileChange":
@@ -686,11 +755,25 @@ class Deviation(BaseSchema):
 
 class Diff(BaseSchema):
     """Diff produced by Coder or Debugger."""
-    plan_version_id: str
+    plan_version_id: str = "v1"
     file_changes: list[FileChange]
-    tests_added: list[str]
-    deviation_log: list[Deviation]
-    change_summary: str
+    tests_added: list[str] = Field(default_factory=list)
+    deviation_log: list[Deviation] = Field(default_factory=list)
+    change_summary: str = "Implementation changes"
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_diff_defaults(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "plan_version_id" not in data:
+                data["plan_version_id"] = "v1"
+            if "tests_added" not in data:
+                data["tests_added"] = []
+            if "deviation_log" not in data:
+                data["deviation_log"] = []
+            if "change_summary" not in data:
+                data["change_summary"] = "Implementation changes"
+        return data
 
     @model_validator(mode="after")
     def validate_file_changes(self) -> "Diff":

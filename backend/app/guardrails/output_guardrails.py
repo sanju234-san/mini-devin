@@ -117,7 +117,7 @@ DENIED_PATH_PATTERNS = (
     r".*id_rsa.*",
     r".*id_ed25519.*",
     r"^\.git/.*",
-    r"^\.github/workflows/.*",
+    r"^\.github/.*",
     r".*secret.*",
     r".*credential.*",
     r".*token.*",

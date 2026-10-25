@@ -39,7 +39,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.agent_gateway import EmptyMetricsProvider, NoOpAgentGateway
+from app.api.agent_gateway import EmptyMetricsProvider, LangGraphAgentGateway, NoOpAgentGateway
 from app.api.run_store import InMemoryRunStore
 from app.config import Settings, get_settings
 
@@ -168,7 +168,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.failed_hooks: list[str] = []
     application.state.http_client = None
     application.state.run_store = InMemoryRunStore()
-    application.state.agent_gateway = NoOpAgentGateway()
+    application.state.agent_gateway = LangGraphAgentGateway()
     application.state.metrics_provider = EmptyMetricsProvider()
 
     # ── CORS ─────────────────────────────────────────────────────────

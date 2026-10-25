@@ -83,15 +83,16 @@ def try_llm_plan_generation(
     """
     try:
         from app.integrations.llm_provider_client import complete
+        from app.agents.issue_utils import format_issue_for_prompt
 
         snippets_text = "\n".join(
             f"--- {s.get('file_path')} (lines {s.get('start_line')}-{s.get('end_line')}) ---\n{s.get('content')}"
             for s in retrieved.get("snippets", [])
         )
+        formatted_issue = format_issue_for_prompt(title, body)
         prompt = (
             f"You are the Planner Agent for Mini-Devin.\n"
-            f"Issue Title: {title}\n"
-            f"Issue Body: {body}\n\n"
+            f"{formatted_issue}\n\n"
             f"Code Evidence:\n{snippets_text}\n\n"
             f"Generate a detailed implementation plan. Your response must be a valid JSON object "
             f"matching the ImplementationPlan schema. Ensure all file paths, steps, and root cause "
@@ -323,6 +324,7 @@ def synthesize_deterministic_plan(
                 ),
                 target_file=target_code_file,
                 action="modify",
+                requirement_ids=["R1"],
             )
         )
     else:
@@ -335,6 +337,7 @@ def synthesize_deterministic_plan(
                 ),
                 target_file="repository_root",
                 action="inspect",
+                requirement_ids=["R1"],
             )
         )
     if retrieved_test_file:
@@ -347,6 +350,7 @@ def synthesize_deterministic_plan(
                 ),
                 target_file=retrieved_test_file,
                 action="modify",
+                requirement_ids=["R2"],
             )
         )
         steps.append(
@@ -358,6 +362,7 @@ def synthesize_deterministic_plan(
                 ),
                 target_file=retrieved_test_file,
                 action="inspect",
+                requirement_ids=["R2"],
             )
         )
     else:
@@ -413,6 +418,15 @@ def synthesize_deterministic_plan(
             [f"Regression test in `{retrieved_test_file}` passes deterministically."]
             if retrieved_test_file else []
         ),
+        non_goals=[
+            "No large architectural refactors across multiple subsystems.",
+            "Do not modify CI/CD workflows, deployment scripts, or .env files.",
+            "Do not modify files outside of the approved affected_files scope.",
+        ],
+        requirements=[
+            {"id": "R1", "description": f"Implement code fix for '{title}'."},
+            {"id": "R2", "description": "Ensure zero regressions and verify test passing."},
+        ],
         test_strategy={
             "existing_tests_to_inspect": existing_tests_to_inspect,
             "new_tests_to_add": (

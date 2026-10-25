@@ -24,6 +24,7 @@ class TestSettingsDefaults:
         assert s.LM_STUDIO_BASE_URL is None
         assert s.MAX_RETRY_ATTEMPTS == 3
         assert s.SANDBOX_BACKEND == "docker"
+        assert s.ALLOW_UNSAFE_HOST_EXECUTION is False
 
     def test_docs_enabled_in_development(self) -> None:
         s = Settings(ENVIRONMENT="development", _env_file=None)

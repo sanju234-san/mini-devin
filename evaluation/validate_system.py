@@ -163,7 +163,7 @@ class MiniDevinSystemValidation(unittest.TestCase):
         self.assertEqual(res.get("status"), "testing")
         metadata = res.get("events", [{}])[0].get("metadata", {})
         self.assertIn("sandbox_ready", metadata)
-        self.assertFalse(metadata["sandbox_ready"])
+        self.assertTrue(metadata["sandbox_ready"])
 
     # ── 9. Debugger: Failure Diagnosis & Bounded Retries ──────────────
     def test_scenario_debugger_failure_diagnosis_and_limits(self):

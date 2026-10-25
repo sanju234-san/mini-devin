@@ -96,7 +96,13 @@ class Settings(BaseSettings):
 
     # ── Agent behaviour ──────────────────────────────────────────────
     MAX_RETRY_ATTEMPTS: int = Field(default=3, ge=1, le=10)
-    SANDBOX_BACKEND: Literal["docker", "e2b"] = "docker"
+    SANDBOX_BACKEND: Literal["docker", "e2b", "codespaces"] = "docker"
+
+    # ── Security & Sandbox Execution ─────────────────────────────────
+    ALLOW_UNSAFE_HOST_EXECUTION: bool = False
+
+    # ── GitHub MCP Server Configuration ──────────────────────────────
+    GITHUB_MCP_PACKAGE: str = "@modelcontextprotocol/server-github@2025.4.8"
 
 
 @functools.lru_cache(maxsize=1)
@@ -126,6 +132,8 @@ _SECRET_ALIASES = frozenset({
 _PLAIN_ALIASES = frozenset({
     "MAX_RETRY_ATTEMPTS",
     "SANDBOX_BACKEND",
+    "ALLOW_UNSAFE_HOST_EXECUTION",
+    "GITHUB_MCP_PACKAGE",
 })
 
 

@@ -113,6 +113,9 @@ def is_path_safe_and_permitted(target_path: Path, permitted_root: Optional[Path]
         return False
 
 
+DEFAULT_PERMITTED_SNAPSHOT_ROOT = Path("workspaces/snapshots").resolve()
+
+
 def resolve_permitted_repo_path(
     repo_input: str,
     permitted_root: Optional[Path] = None,
@@ -121,7 +124,8 @@ def resolve_permitted_repo_path(
     Validate and resolve a repository identifier or path.
     
     Rejects remote slugs (e.g. 'owner/repo') unless they correspond to an
-    actual local directory on disk.
+    actual local directory within the permitted snapshot/checkout root.
+    Arbitrary paths outside permitted bounds are strictly rejected.
     """
     if not repo_input or not repo_input.strip():
         return None
@@ -132,15 +136,31 @@ def resolve_permitted_repo_path(
     # e.g., 'acme/calculator' is a remote GitHub slug
     candidate = Path(raw_path)
     if not candidate.exists():
-        # Check if it was provided relative to permitted_root
+        # Check if candidate exists within explicitly provided permitted_root
         if permitted_root is not None:
             relative_candidate = permitted_root / candidate
             if relative_candidate.exists() and is_path_safe_and_permitted(relative_candidate, permitted_root):
                 return relative_candidate.resolve()
+        # Also check within default snapshots root
+        if DEFAULT_PERMITTED_SNAPSHOT_ROOT.exists():
+            snapshot_candidate = DEFAULT_PERMITTED_SNAPSHOT_ROOT / candidate
+            if snapshot_candidate.exists() and is_path_safe_and_permitted(snapshot_candidate, DEFAULT_PERMITTED_SNAPSHOT_ROOT):
+                return snapshot_candidate.resolve()
         return None
 
-    if is_path_safe_and_permitted(candidate, permitted_root):
-        return candidate.resolve()
+    # If permitted_root is specified, path MUST be within permitted_root
+    if permitted_root is not None:
+        if is_path_safe_and_permitted(candidate, permitted_root):
+            return candidate.resolve()
+        return None
+
+    # If candidate is a safe local directory, verify it does not escape to arbitrary sensitive roots
+    if is_path_safe_and_permitted(candidate):
+        resolved = candidate.resolve()
+        # Reject root directories
+        if resolved == resolved.parent:
+            return None
+        return resolved
 
     return None
 
@@ -422,6 +442,14 @@ class RepositoryIndexer:
         query: str,
         query_terms: Optional[list[str]] = None,
         top_k: int = 5,
+        query_vector: Optional[Sequence[float]] = None,
     ) -> list[SearchResult]:
         """Query the repository index."""
+        if hasattr(self.index, "search"):
+            import inspect
+            sig = inspect.signature(self.index.search)
+            if "query_vector" in sig.parameters:
+                return self.index.search(
+                    query=query, top_k=top_k, query_terms=query_terms, query_vector=query_vector
+                )
         return self.index.search(query=query, top_k=top_k, query_terms=query_terms)

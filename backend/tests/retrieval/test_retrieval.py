@@ -324,6 +324,7 @@ def test_retrieval_node_with_real_local_repository(sample_repo: Path):
         "repo": str(sample_repo),
         "issue_title": "Fix ZeroDivisionError in safe_divide",
         "issue_body": "denominator zero causes exception in math utilities",
+        "cleaned_query": "ZeroDivisionError in safe_divide",
         "events": [],
     }
 
@@ -377,6 +378,8 @@ def test_retrieval_node_missing_checkout_truthfully_reported():
 
 
 # ── Test 12: LangGraph Integration with Real Repo & Planner Handoff ──
+# ... (existing content of test_langgraph_workflow_with_real_retrieval)
+# (The Edit tool will append to the end of the file)
 
 def test_langgraph_workflow_with_real_retrieval(sample_repo: Path):
     """End-to-end LangGraph run with real repository populates Planner with real files."""
@@ -408,3 +411,179 @@ def test_langgraph_workflow_with_real_retrieval(sample_repo: Path):
     plan = values["plan"]
     assert plan is not None
     assert "src/math_utils.py" in plan["affected_files"]
+
+
+# ── Test 13: Context Budgeting Logic ──────────────────────────────────────
+
+from unittest.mock import MagicMock, patch
+
+def test_retrieval_budget_within_limit():
+    """All snippets fit within the 30,000 character budget."""
+    state = {"repo": "mock/repo", "issue_title": "T", "issue_body": "B", "cleaned_query": "Q", "events": []}
+
+    # Mock search results: 2 small snippets
+    mock_results = [
+        MagicMock(content="Short content 1", file_path="f1.py", start_line=1, end_line=5, score=0.9, score_type="lexical"),
+        MagicMock(content="Short content 2", file_path="f2.py", start_line=10, end_line=15, score=0.8, score_type="lexical"),
+    ]
+
+    with patch("app.agents.retrieval.agent.get_or_create_indexer") as mock_indexer_fn:
+        mock_indexer = MagicMock()
+        mock_indexer.index_repository.return_value = {"indexed_files": 2}
+        mock_indexer.search.return_value = mock_results
+        mock_indexer.index.method_name = "lexical_bm25"
+        mock_indexer_fn.return_value = mock_indexer
+
+        with patch("app.agents.retrieval.agent.resolve_permitted_repo_path", return_value=Path("/tmp/mock")), \
+             patch("app.agents.retrieval.agent.transform_query") as mock_trans:
+            mock_trans.return_value = MagicMock(expanded_query="eq", search_terms=["st"])
+
+            result = retrieval_node(state)
+            ctx = result["retrieved_context"]
+
+            assert ctx["chars_used"] == len("Short content 1") + len("Short content 2")
+            assert ctx["is_truncated"] is False
+            assert ctx["is_omitted"] is False
+            assert len(ctx["snippets"]) == 2
+
+def test_retrieval_budget_collective_overflow():
+    """First snippet fits, but subsequent snippets exceed the budget."""
+    state = {"repo": "mock/repo", "issue_title": "T", "issue_body": "B", "cleaned_query": "Q", "events": []}
+
+    # Snippet 1: 10k, Snippet 2: 25k (Total 35k > 30k)
+    s1 = "A" * 10000
+    s2 = "B" * 25000
+    mock_results = [
+        MagicMock(content=s1, file_path="f1.py", start_line=1, end_line=100, score=0.9, score_type="lexical"),
+        MagicMock(content=s2, file_path="f2.py", start_line=1, end_line=100, score=0.8, score_type="lexical"),
+    ]
+
+    with patch("app.agents.retrieval.agent.get_or_create_indexer") as mock_indexer_fn:
+        mock_indexer = MagicMock()
+        mock_indexer.index_repository.return_value = {"indexed_files": 2}
+        mock_indexer.search.return_value = mock_results
+        mock_indexer.index.method_name = "lexical_bm25"
+        mock_indexer_fn.return_value = mock_indexer
+
+        with patch("app.agents.retrieval.agent.resolve_permitted_repo_path", return_value=Path("/tmp/mock")), \
+             patch("app.agents.retrieval.agent.transform_query") as mock_trans:
+            mock_trans.return_value = MagicMock(expanded_query="eq", search_terms=["st"])
+
+            result = retrieval_node(state)
+            ctx = result["retrieved_context"]
+
+            assert ctx["chars_used"] == 10000
+            assert ctx["is_truncated"] is False
+            assert ctx["is_omitted"] is True
+            assert len(ctx["snippets"]) == 1
+            assert ctx["snippets"][0]["content"] == s1
+
+def test_retrieval_budget_oversized_first_snippet():
+    """First snippet alone exceeds the budget; it must be truncated."""
+    state = {"repo": "mock/repo", "issue_title": "T", "issue_body": "B", "cleaned_query": "Q", "events": []}
+
+    s1 = "C" * 40000
+    mock_results = [
+        MagicMock(content=s1, file_path="f1.py", start_line=1, end_line=500, score=0.9, score_type="lexical"),
+    ]
+
+    with patch("app.agents.retrieval.agent.get_or_create_indexer") as mock_indexer_fn:
+        mock_indexer = MagicMock()
+        mock_indexer.index_repository.return_value = {"indexed_files": 1}
+        mock_indexer.search.return_value = mock_results
+        mock_indexer.index.method_name = "lexical_bm25"
+        mock_indexer_fn.return_value = mock_indexer
+
+        with patch("app.agents.retrieval.agent.resolve_permitted_repo_path", return_value=Path("/tmp/mock")), \
+             patch("app.agents.retrieval.agent.transform_query") as mock_trans:
+            mock_trans.return_value = MagicMock(expanded_query="eq", search_terms=["st"])
+
+            result = retrieval_node(state)
+            ctx = result["retrieved_context"]
+
+            assert ctx["chars_used"] == 30000
+            assert ctx["is_truncated"] is True
+            assert len(ctx["snippets"]) == 1
+            assert len(ctx["snippets"][0]["content"]) == 30000
+            assert ctx["snippets"][0]["file_path"] == "f1.py"
+            assert ctx["snippets"][0]["start_line"] == 1
+
+def test_retrieval_budget_exact_boundary():
+    """Content totaling exactly 30,000 characters is retained."""
+    state = {"repo": "mock/repo", "issue_title": "T", "issue_body": "B", "cleaned_query": "Q", "events": []}
+
+    s1 = "X" * 15000
+    s2 = "Y" * 15000
+    mock_results = [
+        MagicMock(content=s1, file_path="f1.py", start_line=1, end_line=10, score=0.9, score_type="lexical"),
+        MagicMock(content=s2, file_path="f2.py", start_line=1, end_line=10, score=0.8, score_type="lexical"),
+    ]
+
+    with patch("app.agents.retrieval.agent.get_or_create_indexer") as mock_indexer_fn:
+        mock_indexer = MagicMock()
+        mock_indexer.index_repository.return_value = {"indexed_files": 2}
+        mock_indexer.search.return_value = mock_results
+        mock_indexer.index.method_name = "lexical_bm25"
+        mock_indexer_fn.return_value = mock_indexer
+
+        with patch("app.agents.retrieval.agent.resolve_permitted_repo_path", return_value=Path("/tmp/mock")), \
+             patch("app.agents.retrieval.agent.transform_query") as mock_trans:
+            mock_trans.return_value = MagicMock(expanded_query="eq", search_terms=["st"])
+
+            result = retrieval_node(state)
+            ctx = result["retrieved_context"]
+
+            assert ctx["chars_used"] == 30000
+            assert ctx["is_truncated"] is False
+            assert ctx["is_omitted"] is False
+            assert len(ctx["snippets"]) == 2
+
+def test_retrieval_budget_unicode():
+    """Non-ASCII characters are counted consistently."""
+    state = {"repo": "mock/repo", "issue_title": "T", "issue_body": "B", "cleaned_query": "Q", "events": []}
+
+    # 10,000 emojis (each typically 2-4 bytes, but Python len() counts characters/code points)
+    s1 = "🚀" * 10000
+    mock_results = [
+        MagicMock(content=s1, file_path="f1.py", start_line=1, end_line=10, score=0.9, score_type="lexical")
+    ]
+
+    with patch("app.agents.retrieval.agent.get_or_create_indexer") as mock_indexer_fn:
+        mock_indexer = MagicMock()
+        mock_indexer.index_repository.return_value = {"indexed_files": 1}
+        mock_indexer.search.return_value = mock_results
+        mock_indexer.index.method_name = "lexical_bm25"
+        mock_indexer_fn.return_value = mock_indexer
+
+        with patch("app.agents.retrieval.agent.resolve_permitted_repo_path", return_value=Path("/tmp/mock")), \
+             patch("app.agents.retrieval.agent.transform_query") as mock_trans:
+            mock_trans.return_value = MagicMock(expanded_query="eq", search_terms=["st"])
+
+            result = retrieval_node(state)
+            ctx = result["retrieved_context"]
+
+            assert ctx["chars_used"] == 10000
+            assert len(ctx["snippets"][0]["content"]) == 10000
+
+def test_retrieval_budget_empty_results():
+    """Empty search results return consistent metadata."""
+    state = {"repo": "mock/repo", "issue_title": "T", "issue_body": "B", "cleaned_query": "Q", "events": []}
+
+    with patch("app.agents.retrieval.agent.get_or_create_indexer") as mock_indexer_fn:
+        mock_indexer = MagicMock()
+        mock_indexer.index_repository.return_value = {"indexed_files": 1}
+        mock_indexer.search.return_value = []
+        mock_indexer.index.method_name = "lexical_bm25"
+        mock_indexer_fn.return_value = mock_indexer
+
+        with patch("app.agents.retrieval.agent.resolve_permitted_repo_path", return_value=Path("/tmp/mock")), \
+             patch("app.agents.retrieval.agent.transform_query") as mock_trans:
+            mock_trans.return_value = MagicMock(expanded_query="eq", search_terms=["st"])
+
+            result = retrieval_node(state)
+            ctx = result["retrieved_context"]
+
+            assert ctx["chars_used"] == 0
+            assert ctx["is_truncated"] is False
+            assert ctx["is_omitted"] is False
+            assert ctx["snippets"] == []

@@ -40,6 +40,16 @@ from app.agents.schemas import (
 )
 
 
+@pytest.fixture(autouse=True)
+def enable_opt_in_sandbox_for_planner_tests(monkeypatch: pytest.MonkeyPatch):
+    """Enable explicit opt-in host execution for planner approval downstream tests."""
+    from app.config import get_settings
+    monkeypatch.setenv("ALLOW_UNSAFE_HOST_EXECUTION", "true")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
 @pytest.fixture
 def sample_retrieved_context() -> dict:
     """Fixture providing authentic repository retrieval evidence."""
@@ -259,9 +269,9 @@ def test_workflow_approval_bound_to_frozen_plan_hash(sample_retrieved_context: d
         }
     )
     final_output = graph.invoke(resume_cmd, config=config)
-    # After approval the graph advances through coder/reviewer stubs.
+    # After approval the graph advances through coder/reviewer stubs to PR agent.
     # Accept any post-approval status (graph has grown since this test was written).
-    assert final_output["status"] in {"completed", "reviewing", "approved"}, (
+    assert final_output["status"] in {"completed", "reviewing", "approved", "submitting_pr", "pr_opened"}, (
         f"Unexpected post-approval status: {final_output['status']!r}"
     )
 
@@ -319,8 +329,8 @@ def test_duplicate_approval_is_idempotent(sample_retrieved_context: dict):
         Command(resume={"decision": "approved", "plan_hash": frozen_hash}),
         config=config,
     )
-    # After approval the graph advances through reviewer/coder stubs.
-    assert first_res["status"] in {"completed", "reviewing", "approved"}, (
+    # After approval the graph advances through reviewer/coder stubs to PR agent.
+    assert first_res["status"] in {"completed", "reviewing", "approved", "submitting_pr", "pr_opened"}, (
         f"Unexpected post-approval status: {first_res['status']!r}"
     )
     first_event_count = len(first_res["events"])
@@ -331,7 +341,7 @@ def test_duplicate_approval_is_idempotent(sample_retrieved_context: dict):
         config=config,
     )
     # Must remain in a post-approval state without duplicate event explosion
-    assert second_res["status"] in {"completed", "reviewing", "approved"}
+    assert second_res["status"] in {"completed", "reviewing", "approved", "submitting_pr", "pr_opened"}
     assert len(second_res["events"]) == first_event_count
 
 

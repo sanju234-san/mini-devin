@@ -1,4 +1,4 @@
-﻿"""
+"""
 Multi-provider LLM client with graceful fallback.
 
 Routing chain: Groq (free tier, low-latency) primary for Planner/Coder/
@@ -9,6 +9,7 @@ Inference API as an open-source-model fallback.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any
 
@@ -30,17 +31,29 @@ def _call_groq(prompt: str) -> str:
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY not configured")
     client = Groq(api_key=GROQ_API_KEY)
-    chat_completion = client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
-        model="llama3-70b-8192",
-    )
-    return chat_completion.choices[0].message.content
+    model_name = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    try:
+        chat_completion = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=model_name,
+        )
+        return chat_completion.choices[0].message.content
+    except Exception as exc:
+        if "decommissioned" in str(exc).lower():
+            # Fallback to current low-latency model
+            chat_completion = client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="llama-3.1-8b-instant",
+            )
+            return chat_completion.choices[0].message.content
+        raise
 
 def _call_gemini(prompt: str) -> str:
     if not GOOGLE_AI_STUDIO_API_KEY:
         raise RuntimeError("GOOGLE_AI_STUDIO_API_KEY not configured")
     genai.configure(api_key=GOOGLE_AI_STUDIO_API_KEY)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
+    model = genai.GenerativeModel(model_name)
     response = model.generate_content(prompt)
     return response.text
 
@@ -48,8 +61,8 @@ def _call_huggingface(prompt: str) -> str:
     if not HUGGINGFACE_API_TOKEN:
         raise RuntimeError("HUGGINGFACE_API_TOKEN not configured")
     client = InferenceClient(token=HUGGINGFACE_API_TOKEN)
-    # Using a general purpose capable model
-    response = client.text_generation(prompt, model="mistralai/Mistral-7B-Instruct-v0.2", max_new_tokens=2048)
+    model_name = os.getenv("HF_MODEL", "mistralai/Mistral-7B-Instruct-v0.3")
+    response = client.text_generation(prompt, model=model_name, max_new_tokens=2048)
     return response
 
 def complete(prompt: str, agent_name: str = ""):

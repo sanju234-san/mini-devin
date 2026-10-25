@@ -337,8 +337,32 @@ def test_unverified_terminal_node(state: AgentState) -> dict[str, Any]:
     """
     Terminal node reached when tests are unverified, missing, or sandbox failed.
     
-    Guarantees unverified code changes never proceed to Reviewer or PR Agent.
+    Guarantees unverified code changes never proceed to Reviewer or PR Agent,
+    and cleanly escalates to human operator when sandbox is unavailable.
     """
+    test_results = state.get("test_results") or {}
+    is_sandbox_unavailable = (
+        test_results.get("sandbox_unavailable", False)
+        if isinstance(test_results, dict)
+        else getattr(test_results, "sandbox_unavailable", False)
+    )
+
+    if is_sandbox_unavailable:
+        logger.warning("Workflow halted for human escalation: sandbox unavailable and host execution disabled.")
+        event = create_event(
+            agent_name="test_runner",
+            event_type="sandbox_unavailable_escalation",
+            status="escalated",
+            message="Workflow halted for human escalation: verification sandbox is unavailable and host execution is disabled.",
+            metadata={"reason": "sandbox_unavailable"},
+        )
+        return {
+            "status": "escalated",
+            "current_agent": "test_runner",
+            "error": "Sandbox unavailable: untrusted host execution is disabled by policy. Awaiting human escalation.",
+            "events": [event],
+        }
+
     logger.warning("Workflow halted: test execution results are missing or unverified.")
     event = create_event(
         agent_name="test_runner",
@@ -382,6 +406,7 @@ def route_test_runner(state: AgentState) -> str:
     """
     Conditional router directing flow after test runner execution:
     - If tests explicitly pass: proceed to reviewer
+    - If sandbox is unavailable or infra failure: halt at test_unverified_terminal (escalation, no debugger retry)
     - If tests explicitly fail and retry attempts remain: loop to debugger -> coder -> test_runner
     - If retry limit reached: halt at retry_limit_terminal
     - If tests are missing:
@@ -404,6 +429,19 @@ def route_test_runner(state: AgentState) -> str:
         passed = True
 
     if not passed:
+        infra_failure = False
+        sandbox_unavailable = False
+        if isinstance(test_results, dict):
+            infra_failure = bool(test_results.get("infrastructure_failure", False))
+            sandbox_unavailable = bool(test_results.get("sandbox_unavailable", False))
+        elif hasattr(test_results, "infrastructure_failure"):
+            infra_failure = bool(getattr(test_results, "infrastructure_failure", False))
+            sandbox_unavailable = bool(getattr(test_results, "sandbox_unavailable", False))
+
+        if infra_failure or sandbox_unavailable:
+            logger.warning("Test failure is infrastructural or sandbox is unavailable. Halting / routing to escalation.")
+            return "test_unverified_terminal"
+
         retry_count = state.get("retry_count", 0)
         max_retries = state.get("max_retries", 3)
         if retry_count >= max_retries:
@@ -426,14 +464,34 @@ def route_reviewer(state: AgentState) -> str:
     """
     Conditional router directing flow after Reviewer execution:
     - If review_findings explicitly approves the patch: proceed to pr_agent
-    - If review_findings is missing, incomplete, or not approved:
+    - If strict_verification mode and unapproved: halt at review_rejected_terminal
+    - If verdict == 'revise' and review revisions remain: loop back to coder
+    - If review_findings is blocked, unapproved, or revisions exhausted:
         * In strict_verification mode: halt at review_rejected_terminal
         * In default mode: halt cleanly at END
     """
     findings = state.get("review_findings")
     if _is_review_approved(findings):
         return "pr_agent"
+
     if state.get("strict_verification", False):
+        return "review_rejected_terminal"
+
+    verdict = ""
+    if isinstance(findings, dict):
+        verdict = findings.get("verdict", "")
+    elif hasattr(findings, "verdict"):
+        verdict = getattr(findings, "verdict", "")
+
+    if verdict == "revise":
+        rev_count = state.get("review_revisions", 0)
+        max_rev = state.get("max_review_revisions", 2)
+        if rev_count < max_rev:
+            logger.info("Reviewer requested revision (attempt %d/%d). Routing back to coder.", rev_count + 1, max_rev)
+            return "coder"
+        logger.warning("Reviewer revision limit reached (%d/%d). Halting.", rev_count, max_rev)
+
+    if verdict == "block":
         return "review_rejected_terminal"
     return END
 
@@ -506,6 +564,7 @@ def create_workflow_graph() -> StateGraph:
         route_reviewer,
         {
             "pr_agent": "pr_agent",
+            "coder": "coder",
             "review_rejected_terminal": "review_rejected_terminal",
             END: END,
         },
