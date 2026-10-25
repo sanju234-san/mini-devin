@@ -18,6 +18,7 @@ from typing import Any, Optional, Sequence
 
 from app.retrieval.vector_store import (
     ChunkMetadata,
+    HybridIndex,
     LexicalIndex,
     SearchResult,
     is_faiss_available,
@@ -279,12 +280,12 @@ class RepositoryIndexer:
     def __init__(
         self,
         repo_path: Path,
-        index: Optional[LexicalIndex] = None,
+        index: Optional[Any] = None,
         chunk_size: int = 50,
         chunk_overlap: int = 10,
     ):
         self.repo_path = repo_path.resolve()
-        self.index = index or LexicalIndex()
+        self.index = index if index is not None else HybridIndex()
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.file_hashes: dict[str, str] = {}  # rel_path -> sha256

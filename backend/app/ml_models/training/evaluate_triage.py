@@ -70,12 +70,16 @@ def evaluate_triage(
     precisions, recalls, f1s, supports = precision_recall_fscore_support(
         y_true, y_pred, labels=CLASSES, zero_division=0
     )
+    macro_precision = float(np.mean(precisions))
+    macro_recall = float(np.mean(recalls))
     macro_f1 = float(np.mean(f1s))
     cm = confusion_matrix(y_true, y_pred, labels=CLASSES).tolist()
 
     per_class = {}
     print("\n--- Evaluation Metrics ---")
     print(f"Accuracy: {acc:.4f}")
+    print(f"Macro-Precision: {macro_precision:.4f}")
+    print(f"Macro-Recall: {macro_recall:.4f}")
     print(f"Macro-F1: {macro_f1:.4f}")
     print(f"Test Set Size: {len(records)}\n")
     print(f"{'Class':<15} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}")
@@ -126,6 +130,8 @@ def evaluate_triage(
 
     metrics = {
         "accuracy": acc,
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
         "macro_f1": macro_f1,
         "per_class": per_class,
         "confusion_matrix": cm,

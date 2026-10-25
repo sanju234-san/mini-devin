@@ -21,6 +21,7 @@ from app.agents.model_router import route
 from app.agents.schemas import (
     AgentState,
     ImplementationPlan,
+    PlanAdequacyReport,
     PlanEvidence,
     PlanStep,
     RetrievedContext,
@@ -92,7 +93,19 @@ def try_llm_plan_generation(
             f"Issue Title: {title}\n"
             f"Issue Body: {body}\n\n"
             f"Code Evidence:\n{snippets_text}\n\n"
-            f"Generate a valid JSON object matching the ImplementationPlan schema."
+            f"Generate a detailed implementation plan. Your response must be a valid JSON object "
+            f"matching the ImplementationPlan schema. Ensure all file paths, steps, and root cause "
+            f"findings are grounded in the provided Code Evidence.\n"
+            f"Schema requirements:\n"
+            f"- summary: Concise goal\n"
+            f"- explanation: Detailed engineering reasoning\n"
+            f"- steps: List of PlanStep objects (description, step_number, target_file, action)\n"
+            f"- affected_files: List of file paths to be modified\n"
+            f"- root_cause: RootCauseAnalysis object (evidence_backed_findings, hypotheses)\n"
+            f"- acceptance_criteria: List of measurable criteria\n"
+            f"- test_strategy: Dict with existing_tests_to_inspect and new_tests_to_add\n"
+            f"- suggested_verification_commands: List of bash commands (e.g. pytest)\n"
+            f"- provenance: Set to 'llm_generated'\n"
         )
         response = complete(prompt, agent_name="planner")
         if response and isinstance(response, str):
@@ -428,12 +441,100 @@ def synthesize_deterministic_plan(
     )
 
 
+def evaluate_plan_adequacy(
+    plan: ImplementationPlan,
+    retrieved: Optional[dict[str, Any]] = None,
+) -> PlanAdequacyReport:
+    """
+    Deterministic verification of plan adequacy before human review.
+
+    Evaluates:
+    1. Actionable implementation steps with target files.
+    2. Explicit affected files list.
+    3. Grounded code evidence or root cause analysis.
+    4. Measurable acceptance criteria.
+    5. Test verification strategy and commands.
+    """
+    findings: list[str] = []
+    missing: list[str] = []
+    recommendations: list[str] = []
+    penalties = 0.0
+
+    # 1. Implementation Steps
+    if not plan.steps:
+        missing.append("No atomic implementation steps defined.")
+        recommendations.append("Define at least one structured step with a target file and action.")
+        penalties += 0.35
+    else:
+        findings.append(f"Plan defines {len(plan.steps)} structured step(s).")
+        unspecified_targets = [s for s in plan.steps if not s.target_file]
+        if unspecified_targets:
+            missing.append(f"{len(unspecified_targets)} step(s) lack an explicit target file.")
+            penalties += 0.1
+
+    # 2. Affected Files
+    if not plan.affected_files:
+        missing.append("Affected files list is empty.")
+        recommendations.append("Specify the exact repository file paths expected to be modified.")
+        penalties += 0.25
+    else:
+        findings.append(f"Affects {len(plan.affected_files)} file(s): {', '.join(plan.affected_files[:3])}")
+
+    # 3. Grounded Code Evidence & Root Cause
+    evidence_count = len(plan.evidence_items) if plan.evidence_items else 0
+    rc_findings = (
+        len(plan.root_cause.evidence_backed_findings)
+        if plan.root_cause and plan.root_cause.evidence_backed_findings
+        else 0
+    )
+    if evidence_count == 0 and rc_findings == 0:
+        missing.append("No grounded code evidence citations or root cause findings.")
+        recommendations.append("Ground plan in authentic repository snippets or root-cause findings.")
+        penalties += 0.2
+    else:
+        findings.append(
+            f"Supported by {evidence_count} grounded code citation(s) and {rc_findings} root-cause finding(s)."
+        )
+
+    # 4. Acceptance Criteria
+    if not plan.acceptance_criteria:
+        missing.append("Acceptance criteria are missing.")
+        recommendations.append("Provide explicit checklist criteria to verify issue resolution.")
+        penalties += 0.15
+    else:
+        findings.append(f"Specifies {len(plan.acceptance_criteria)} acceptance criteria.")
+
+    # 5. Test Strategy & Verification Commands
+    has_test_strat = bool(
+        plan.test_strategy
+        and (plan.test_strategy.get("existing_tests_to_inspect") or plan.test_strategy.get("new_tests_to_add"))
+    )
+    has_cmds = bool(plan.suggested_verification_commands)
+    if not has_test_strat and not has_cmds:
+        missing.append("Missing test strategy and verification commands.")
+        recommendations.append("Include verification commands (e.g., pytest) to run in the sandbox.")
+        penalties += 0.15
+    else:
+        findings.append("Verification commands and test strategy are documented.")
+
+    score = max(0.0, round(1.0 - penalties, 2))
+    is_adequate = score >= 0.65 and bool(plan.steps) and bool(plan.affected_files)
+
+    return PlanAdequacyReport(
+        is_adequate=is_adequate,
+        score=score,
+        findings=findings,
+        missing_elements=missing,
+        recommendations=recommendations,
+    )
+
+
 def planner_node(state: AgentState, config: Optional[RunnableConfig] = None) -> dict[str, Any]:
     """
     Planner Agent Node: Synthesizes issue details and code evidence into a concrete,
     frozen implementation plan.
     
-    Calculates a deterministic cryptographic hash of the plan, freezes it in state,
+    Evaluates plan adequacy, freezes with deterministic cryptographic hash,
     and pauses for human operator approval.
     """
     tier = route("planner")
@@ -469,7 +570,12 @@ def planner_node(state: AgentState, config: Optional[RunnableConfig] = None) -> 
             repo=repo,
         )
 
-    # 3. Freeze the plan with a deterministic SHA-256 hash
+    # 3. Deterministically evaluate plan adequacy
+    adequacy = evaluate_plan_adequacy(plan=plan, retrieved=retrieved_dict)
+    plan.adequacy_report = adequacy
+    adequacy_dict = adequacy.model_dump(mode="json")
+
+    # 4. Freeze the plan with a deterministic SHA-256 hash
     plan_dict = plan.model_dump(mode="json")
     plan_hash = compute_plan_hash(plan_dict)
     plan.plan_hash = plan_hash
@@ -479,7 +585,11 @@ def planner_node(state: AgentState, config: Optional[RunnableConfig] = None) -> 
         agent_name="planner",
         event_type="plan_generated",
         status="awaiting_approval",
-        message=f"Implementation plan generated and frozen (v1:{plan_hash[:8]}). Awaiting human approval.",
+        message=(
+            f"Implementation plan generated and frozen (v1:{plan_hash[:8]}). "
+            f"Adequacy: {'PASS' if adequacy.is_adequate else 'NEEDS_REVISION'} ({int(adequacy.score * 100)}%). "
+            "Awaiting human approval."
+        ),
         metadata={
             "tier": tier.value,
             "plan_version": plan.plan_version,
@@ -488,6 +598,9 @@ def planner_node(state: AgentState, config: Optional[RunnableConfig] = None) -> 
             "step_count": len(plan.steps),
             "evidence_count": len(plan.evidence_items),
             "provenance": plan.provenance,
+            "adequacy_score": adequacy.score,
+            "is_adequate": adequacy.is_adequate,
+            "missing_elements": adequacy.missing_elements,
         },
     )
 
@@ -495,6 +608,7 @@ def planner_node(state: AgentState, config: Optional[RunnableConfig] = None) -> 
         "plan": plan_dict,
         "plan_version": plan.plan_version,
         "plan_hash": plan_hash,
+        "plan_adequacy": adequacy_dict,
         "status": "awaiting_approval",
         "current_agent": "planner",
         "events": [event],

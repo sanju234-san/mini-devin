@@ -104,3 +104,115 @@ def validate_triage_output(
             reason=f"{fallback_reason} (Validation error: {exc})",
             warnings=[f"Malformed output guarded: {exc}"],
         )
+
+
+# ── Dangerous Path & Diff Safety Guardrails ──────────────────────────
+
+DENIED_PATH_PATTERNS = (
+    r"^\.env.*",
+    r".*\.pem$",
+    r".*\.key$",
+    r".*\.pfx$",
+    r".*\.pkcs12$",
+    r".*id_rsa.*",
+    r".*id_ed25519.*",
+    r"^\.git/.*",
+    r"^\.github/workflows/.*",
+    r".*secret.*",
+    r".*credential.*",
+    r".*token.*",
+)
+_DENIED_REGEXES = [re.compile(p, re.IGNORECASE) for p in DENIED_PATH_PATTERNS]
+
+
+def validate_path_safety(file_path: str) -> tuple[bool, str]:
+    """
+    Check if a file path is safe from path traversal and sensitive denylists.
+    
+    Returns (is_safe, violation_reason).
+    """
+    if not file_path or not file_path.strip():
+        return False, "File path is empty."
+
+    norm = file_path.strip().replace("\\", "/")
+
+    # Check directory traversal
+    if ".." in norm.split("/"):
+        return False, f"Path traversal ('..') detected in '{file_path}'."
+
+    # Check absolute path escapes
+    if norm.startswith("/") or re.match(r"^[A-Za-z]:", norm):
+        return False, f"Absolute path '{file_path}' is forbidden; paths must be repository-relative."
+
+    # Check sensitive denylist
+    for rx in _DENIED_REGEXES:
+        if rx.search(norm):
+            return False, f"Access to sensitive file pattern '{rx.pattern}' in '{file_path}' is denied."
+
+    return True, ""
+
+
+def validate_diff_safety(file_changes: Sequence[dict[str, Any] | Any]) -> tuple[bool, list[str]]:
+    """
+    Validate proposed file changes against sensitive file denylists.
+    
+    Returns (is_clean, violations).
+    """
+    violations: list[str] = []
+    if not file_changes:
+        return True, []
+
+    for change in file_changes:
+        path = change.get("path") if isinstance(change, dict) else getattr(change, "path", "")
+        if not path:
+            path = change.get("file_path") if isinstance(change, dict) else getattr(change, "file_path", "")
+        is_safe, reason = validate_path_safety(path)
+        if not is_safe:
+            violations.append(reason)
+            logger.warning("Diff gate guardrail triggered: %s", reason)
+
+    return len(violations) == 0, violations
+
+
+def validate_plan_output(data: dict[str, Any]) -> tuple[bool, dict[str, Any], list[str]]:
+    """
+    Validate and sanitize structured implementation plan output from LLM.
+    
+    Guarantees:
+    - Secrets are redacted from explanation, summary, and step descriptions.
+    - Affected files satisfy path safety.
+    - Required fields (summary, steps) are present.
+    """
+    violations: list[str] = []
+    sanitized: dict[str, Any] = dict(data)
+
+    # Redact sensitive values from text fields
+    if "summary" in sanitized:
+        sanitized["summary"] = redact_secrets(str(sanitized["summary"]))
+    if "explanation" in sanitized:
+        sanitized["explanation"] = redact_secrets(str(sanitized["explanation"]))
+
+    steps = sanitized.get("steps", [])
+    if not steps:
+        violations.append("Plan contains no implementation steps.")
+    else:
+        for idx, s in enumerate(steps):
+            if isinstance(s, dict):
+                s["description"] = redact_secrets(str(s.get("description", "")))
+                target = s.get("target_file", "")
+                if target:
+                    is_safe, reason = validate_path_safety(target)
+                    if not is_safe:
+                        violations.append(f"Step {idx+1}: {reason}")
+
+    affected = sanitized.get("affected_files", [])
+    if not affected:
+        violations.append("Plan affected_files list is empty.")
+    else:
+        for af in affected:
+            is_safe, reason = validate_path_safety(af)
+            if not is_safe:
+                violations.append(f"Affected file: {reason}")
+
+    is_valid = len(violations) == 0
+    return is_valid, sanitized, violations

@@ -338,3 +338,140 @@ def is_faiss_available() -> bool:
         return True
     except (ImportError, Exception):
         return False
+
+
+# ── Hybrid Retrieval Index (Dense FAISS + Sparse BM25 via RRF) ───────
+
+class HybridIndex:
+    """
+    Hybrid Retrieval Index combining Dense Vector Search (FAISS)
+    and Sparse Lexical Search (BM25) using Reciprocal Rank Fusion (RRF).
+
+    Gracefully falls back to pure BM25 LexicalIndex whenever embedding models
+    or FAISS dependencies are unavailable, never fabricating vector similarity.
+    """
+
+    def __init__(
+        self,
+        dimension: Optional[int] = None,
+        embed_fn: Optional[Callable[[list[str]], list[list[float]]]] = None,
+        k1: float = 1.5,
+        b: float = 0.75,
+        rrf_k: int = 60,
+    ):
+        self.k1 = k1
+        self.b = b
+        self.rrf_k = rrf_k
+        self.lexical_index = LexicalIndex(k1=k1, b=b)
+        self.dense_store: Optional[FAISSVectorStore] = None
+        self._dense_enabled = False
+
+        if is_faiss_available() and dimension is not None and embed_fn is not None:
+            try:
+                self.dense_store = FAISSVectorStore(dimension=dimension, embed_fn=embed_fn)
+                self._dense_enabled = True
+            except Exception as exc:
+                logger.warning("FAISS initialization failed (%s); operating in lexical fallback mode.", exc)
+                self.dense_store = None
+                self._dense_enabled = False
+
+    @property
+    def chunks(self) -> dict[str, ChunkMetadata]:
+        return self.lexical_index.chunks
+
+    @property
+    def method_name(self) -> str:
+        if self._dense_enabled and self.dense_store is not None:
+            return "hybrid_rrf"
+        return "lexical_bm25"
+
+    def clear(self) -> None:
+        self.lexical_index.clear()
+        if self.dense_store is not None:
+            try:
+                self.dense_store.index.reset()
+                self.dense_store.chunks.clear()
+                self.dense_store.chunk_ids.clear()
+            except Exception:
+                pass
+
+    def remove_file(self, file_path: str) -> None:
+        self.lexical_index.remove_file(file_path)
+
+    def add_chunks(
+        self,
+        chunks: Sequence[ChunkMetadata],
+        embeddings: Optional[Sequence[Sequence[float]]] = None,
+    ) -> None:
+        """Add chunks to lexical index, and to dense store if available."""
+        self.lexical_index.add_chunks(chunks)
+
+        if self._dense_enabled and self.dense_store is not None:
+            try:
+                self.dense_store.add_chunks(chunks, embeddings=embeddings)
+            except (NotImplementedError, Exception) as exc:
+                logger.info(
+                    "Dense embedding indexing unavailable (%s); maintaining lexical BM25 index.",
+                    exc,
+                )
+                self._dense_enabled = False
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        query_terms: Optional[list[str]] = None,
+        query_vector: Optional[Sequence[float]] = None,
+    ) -> list[SearchResult]:
+        """
+        Execute search. If dense retrieval is active, combines dense and
+        lexical results using Reciprocal Rank Fusion (RRF). Otherwise, returns
+        lexical BM25 results.
+        """
+        lexical_results = self.lexical_index.search(
+            query=query, top_k=top_k * 2, query_terms=query_terms
+        )
+
+        dense_results: list[SearchResult] = []
+        if self._dense_enabled and self.dense_store is not None:
+            try:
+                dense_results = self.dense_store.search(
+                    query=query, top_k=top_k * 2, query_vector=query_vector
+                )
+            except (NotImplementedError, Exception) as exc:
+                logger.debug("Dense vector search omitted (%s); using lexical results.", exc)
+                dense_results = []
+
+        if not dense_results:
+            return lexical_results[:top_k]
+
+        # Reciprocal Rank Fusion (RRF)
+        rrf_scores: dict[str, float] = {}
+        chunk_map: dict[str, SearchResult] = {}
+
+        for rank, res in enumerate(lexical_results, start=1):
+            key = f"{res.file_path}#{res.start_line}-{res.end_line}"
+            rrf_scores[key] = rrf_scores.get(key, 0.0) + (1.0 / (self.rrf_k + rank))
+            chunk_map[key] = res
+
+        for rank, res in enumerate(dense_results, start=1):
+            key = f"{res.file_path}#{res.start_line}-{res.end_line}"
+            rrf_scores[key] = rrf_scores.get(key, 0.0) + (1.0 / (self.rrf_k + rank))
+            if key not in chunk_map:
+                chunk_map[key] = res
+
+        ranked_keys = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        combined: list[SearchResult] = []
+        for key, rrf_score in ranked_keys:
+            base = chunk_map[key]
+            combined.append(
+                SearchResult(
+                    file_path=base.file_path,
+                    start_line=base.start_line,
+                    end_line=base.end_line,
+                    content=base.content,
+                    score=round(rrf_score, 6),
+                    score_type="hybrid_rrf",
+                )
+            )
+        return combined

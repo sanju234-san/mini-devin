@@ -108,6 +108,15 @@ class PlanStep(BaseModel):
     files: list[str] = Field(default_factory=list)
 
 
+class PlanAdequacyReport(BaseModel):
+    """Deterministic verification of plan adequacy before human review."""
+    is_adequate: bool = True
+    score: float = Field(default=1.0, ge=0.0, le=1.0)
+    findings: list[str] = Field(default_factory=list)
+    missing_elements: list[str] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+
+
 class ImplementationPlan(BaseModel):
     """Structured implementation plan proposed by the Planner Agent."""
     summary: str
@@ -129,6 +138,7 @@ class ImplementationPlan(BaseModel):
     risks_and_assumptions: list[str] = Field(default_factory=list)
     suggested_verification_commands: list[str] = Field(default_factory=list)
     provenance: str = "deterministic_evidence_synthesis"
+    adequacy_report: Optional[PlanAdequacyReport] = None
 
 
 # ── Human Approval Schemas ──────────────────────────────────────
@@ -234,6 +244,7 @@ class AgentState(TypedDict, total=False):
     plan: Optional[ImplementationPlan | dict[str, Any]]
     plan_version: Optional[str]
     plan_hash: Optional[str]
+    plan_adequacy: Optional[PlanAdequacyReport | dict[str, Any]]
     human_approval: Optional[ApprovalDecision | dict[str, Any]]
     
     # Retry & Loop Limits
@@ -244,7 +255,15 @@ class AgentState(TypedDict, total=False):
     code_changes: Optional[list[PatchMetadata | dict[str, Any]]]
     test_results: Optional[TestResults | dict[str, Any]]
     review_findings: Optional[ReviewFindings | dict[str, Any]]
-    
+
+    # Browser Testing Extension (optional; set by caller to enable Playwright runs)
+    # browser_test_url  – explicit permitted URL to run browser scenarios against.
+    #                     Must start with an allowlisted prefix (localhost/127.0.0.1).
+    #                     Leave None to skip browser testing entirely.
+    # browser_test_results – BrowserTestReport dict written by test_runner_node.
+    browser_test_url: Optional[str]
+    browser_test_results: Optional[dict[str, Any]]
+
     # Overall Workflow Status & Observability
     status: str  # "pending", "triaging", "retrieving", "planning", "awaiting_approval", "approved", "rejected", "out_of_scope", "completed", "failed"
     current_agent: Optional[str]
@@ -300,10 +319,27 @@ def format_plan_as_markdown(plan: Any) -> str:
         f"# 📋 Implementation Plan: {summary}",
         f"**Plan Version:** `{version}` | **Plan Hash:** `{short_hash}` | **Complexity:** `{complexity}` | **Provenance:** `{provenance}`",
         "",
+    ]
+
+    adeq = p.get("adequacy_report")
+    if adeq and isinstance(adeq, dict):
+        status_label = "PASS — Adequate for Implementation" if adeq.get("is_adequate", True) else "NEEDS REVISION"
+        score_pct = int(adeq.get("score", 1.0) * 100)
+        lines.append("## 🔍 Plan Adequacy Assessment")
+        lines.append(f"- **Verification Verdict:** `{status_label}` (Score: `{score_pct}%`)")
+        for f in adeq.get("findings", []):
+            lines.append(f"- ℹ️ {f}")
+        for m in adeq.get("missing_elements", []):
+            lines.append(f"- ⚠️ Missing: {m}")
+        for r in adeq.get("recommendations", []):
+            lines.append(f"- 💡 Recommendation: {r}")
+        lines.append("")
+
+    lines.extend([
         "## 1. Summary & Intended Behavior",
         explanation or summary,
         "",
-    ]
+    ])
 
     rc = p.get("root_cause")
     if rc:

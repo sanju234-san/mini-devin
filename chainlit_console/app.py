@@ -573,13 +573,25 @@ async def on_message(message: cl.Message):
         final_status = final_result.get("status", "unknown")
         events = final_result.get("events", [])
 
+        error_detail = final_result.get("error")
+
         if decision == "approved":
+            if final_status == "pr_opened":
+                msg_title = "🎉 **Pull Request Created Successfully**"
+                handoff_text = f"- **PR Link / Artifacts:** `{final_result.get('pull_request_url', 'created')}`"
+            elif final_status == "failed":
+                msg_title = "⚠️ **Plan Approved, but Downstream Execution Halted**"
+                handoff_text = f"- **Halt Reason:** {error_detail or 'Downstream sandbox or review verification incomplete.'}"
+            else:
+                msg_title = "✅ **Plan Approved & Workflow Advanced**"
+                handoff_text = "- **Stage Result:** Checkpoint saved; ready for subsequent verification."
+
             await cl.Message(
                 content=(
-                    f"🎉 **Plan Approved & Workflow Completed**\n\n"
-                    f"- **Status:** `{final_status}`\n"
+                    f"{msg_title}\n\n"
+                    f"- **Workflow Status:** `{final_status}`\n"
                     f"- **Checkpoint Thread:** `{thread_id}`\n"
-                    f"- **Handoff:** Ready for Coder Agent (Day 2 Milestone)\n"
+                    f"{handoff_text}\n"
                     f"- **Total Events Logged:** {len(events)}"
                 )
             ).send()
@@ -587,7 +599,7 @@ async def on_message(message: cl.Message):
             await cl.Message(
                 content=(
                     f"🛑 **Plan Rejected & Workflow Terminated Safely**\n\n"
-                    f"- **Status:** `{final_status}`\n"
+                    f"- **Workflow Status:** `{final_status}`\n"
                     f"- **Checkpoint Thread:** `{thread_id}`\n"
                     f"- **Safety Guarantee:** Zero code changes or pull requests attempted.\n"
                     f"- **Total Events Logged:** {len(events)}"

@@ -153,7 +153,7 @@ def test_approved_plan_resumes_with_same_thread_id(memory_checkpointer: MemorySa
 
     # Verify coder, test_runner, and reviewer events were appended in sequence
     coder_events = [e for e in final_output["events"] if e.get("agent_name") == "coder"]
-    assert len(coder_events) == 1
+    assert len(coder_events) == 2
     assert coder_events[0]["event_type"] == "code_generation_started"
     assert coder_events[0]["status"] == "in_progress"
 
@@ -444,7 +444,7 @@ def test_approved_path_invokes_coder_test_runner_and_reviewer(memory_checkpointe
 
     # Verify coder event
     coder_events = [e for e in final_output["events"] if e.get("agent_name") == "coder"]
-    assert len(coder_events) == 1
+    assert len(coder_events) == 2
     assert coder_events[0]["event_type"] == "code_generation_started"
     assert coder_events[0]["status"] == "in_progress"
     assert "Coder Agent initialized" in coder_events[0]["message"]

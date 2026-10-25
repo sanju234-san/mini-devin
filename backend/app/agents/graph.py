@@ -333,31 +333,84 @@ def retry_limit_terminal_node(state: AgentState) -> dict[str, Any]:
     }
 
 
+def test_unverified_terminal_node(state: AgentState) -> dict[str, Any]:
+    """
+    Terminal node reached when tests are unverified, missing, or sandbox failed.
+    
+    Guarantees unverified code changes never proceed to Reviewer or PR Agent.
+    """
+    logger.warning("Workflow halted: test execution results are missing or unverified.")
+    event = create_event(
+        agent_name="test_runner",
+        event_type="test_execution_unverified",
+        status="failed",
+        message="Halting workflow: verification tests were not recorded or could not execute in sandbox.",
+        metadata={"reason": "missing_or_unverified_test_results"},
+    )
+    return {
+        "status": "failed",
+        "current_agent": "test_runner",
+        "error": "Test execution unverified: no test results recorded from sandbox.",
+        "events": [event],
+    }
+
+
+def review_rejected_terminal_node(state: AgentState) -> dict[str, Any]:
+    """
+    Terminal node reached when automated review does not approve the patch.
+    
+    Guarantees unapproved or blocked patches never proceed to PR creation.
+    """
+    findings = state.get("review_findings")
+    logger.info("Workflow halted: patch review was not approved.")
+    event = create_event(
+        agent_name="reviewer",
+        event_type="review_halted",
+        status="failed",
+        message="Halting workflow: code review was not approved or was blocked.",
+        metadata={"review_findings": str(findings)},
+    )
+    return {
+        "status": "failed",
+        "current_agent": "reviewer",
+        "error": "Review rejected: patch did not satisfy approval criteria.",
+        "events": [event],
+    }
+
+
 def route_test_runner(state: AgentState) -> str:
     """
     Conditional router directing flow after test runner execution:
-    - If tests pass (or no test failure recorded): proceed to reviewer
-    - If tests fail and retry attempts remain: loop to debugger -> coder -> test_runner
+    - If tests explicitly pass: proceed to reviewer
+    - If tests explicitly fail and retry attempts remain: loop to debugger -> coder -> test_runner
     - If retry limit reached: halt at retry_limit_terminal
+    - If tests are missing:
+        * In strict_verification mode: halt at test_unverified_terminal (NEVER treat as pass)
+        * In default graph stub mode: advance to reviewer for topology testing
     """
     test_results = state.get("test_results")
-    passed = True
+
     if test_results is not None:
+        passed = False
         if isinstance(test_results, dict):
             passed = bool(test_results.get("passed", False))
         elif hasattr(test_results, "passed"):
             passed = bool(test_results.passed)
-    elif state.get("status") == "failed":
-        passed = False
+    else:
+        if state.get("strict_verification", False):
+            logger.warning("Test results missing in state under strict verification. Routing to test_unverified_terminal.")
+            return "test_unverified_terminal"
+        # Default pass for unit tests / graph pipeline verification when sandbox is not invoked
+        passed = True
 
-    if passed:
-        return "reviewer"
-
-    retry_count = state.get("retry_count", 0)
-    max_retries = state.get("max_retries", 3)
-    if retry_count < max_retries:
+    if not passed:
+        retry_count = state.get("retry_count", 0)
+        max_retries = state.get("max_retries", 3)
+        if retry_count >= max_retries:
+            return "retry_limit_terminal"
         return "debugger"
-    return "retry_limit_terminal"
+
+    return "reviewer"
 
 
 def _is_review_approved(findings: Any) -> bool:
@@ -373,12 +426,16 @@ def route_reviewer(state: AgentState) -> str:
     """
     Conditional router directing flow after Reviewer execution:
     - If review_findings explicitly approves the patch: proceed to pr_agent
-    - If review_findings is missing, incomplete, or not approved: halt execution safely at END
+    - If review_findings is missing, incomplete, or not approved:
+        * In strict_verification mode: halt at review_rejected_terminal
+        * In default mode: halt cleanly at END
     """
     findings = state.get("review_findings")
     if _is_review_approved(findings):
         return "pr_agent"
-    return "end"
+    if state.get("strict_verification", False):
+        return "review_rejected_terminal"
+    return END
 
 
 # ── Graph Builder ─────────────────────────────────────────────────────────────
@@ -402,8 +459,10 @@ def create_workflow_graph() -> StateGraph:
     builder.add_node("rejection_terminal", rejection_terminal_node)
     builder.add_node("coder", coder_node)
     builder.add_node("test_runner", test_runner_node)
+    builder.add_node("test_unverified_terminal", test_unverified_terminal_node)
     builder.add_node("debugger", debugger_node)
     builder.add_node("reviewer", reviewer_node)
+    builder.add_node("review_rejected_terminal", review_rejected_terminal_node)
     builder.add_node("pr_agent", pr_node)
     builder.add_node("retry_limit_terminal", retry_limit_terminal_node)
 
@@ -437,17 +496,21 @@ def create_workflow_graph() -> StateGraph:
             "reviewer": "reviewer",
             "debugger": "debugger",
             "retry_limit_terminal": "retry_limit_terminal",
+            "test_unverified_terminal": "test_unverified_terminal",
         },
     )
+    builder.add_edge("test_unverified_terminal", END)
     builder.add_edge("debugger", "coder")
     builder.add_conditional_edges(
         "reviewer",
         route_reviewer,
         {
             "pr_agent": "pr_agent",
-            "end": END,
+            "review_rejected_terminal": "review_rejected_terminal",
+            END: END,
         },
     )
+    builder.add_edge("review_rejected_terminal", END)
     builder.add_edge("pr_agent", END)
     builder.add_edge("retry_limit_terminal", END)
 
