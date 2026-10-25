@@ -16,6 +16,7 @@ from typing import Protocol, runtime_checkable
 from uuid import UUID
 
 from app.models.metrics import MetricsOut
+from app.models.plan import PlanDecision
 from app.models.run import IssueIn, RunStatus
 
 logger = logging.getLogger(__name__)
@@ -97,4 +98,76 @@ async def run_agent_background_task(
                 run_id,
                 status=RunStatus.failed,
                 error="Failed to start agent run",
+            )
+
+
+# ── Plan Resume Interface ──────────────────────────────────────────────────────
+
+
+@runtime_checkable
+class PlanResumer(Protocol):
+    """Protocol for resuming a paused agent run after a human plan decision.
+
+    When the Planner pauses the graph for human review, Sanjeevni's agent
+    layer provides a concrete implementation of this protocol that calls
+    the LangGraph compiled graph with the resume Command.
+
+    The REST API layer depends on this Protocol (not on any concrete agent
+    class) so the API can run without the agent layer and tests can inject
+    a fake resumer via dependency_overrides.
+    """
+
+    async def resume(self, run_id: UUID, decision: PlanDecision) -> None:
+        """Resume a graph that is paused at the human_approval interrupt.
+
+        Args:
+            run_id:   The UUID of the run to resume. The agent layer converts
+                      this to the LangGraph thread_id (thread_id == str(run_id)).
+            decision: The human decision (approve / edit / reject).
+        """
+        ...
+
+
+class NoOpPlanResumer:
+    """Default no-op plan resumer stub.
+
+    Logs that no resume implementation is wired and leaves the run in
+    whatever status claim_plan_decision set. Used until Sanjeevni's agent
+    layer wires a real resumer via application.state.plan_resumer.
+    """
+
+    async def resume(self, run_id: UUID, decision: PlanDecision) -> None:
+        # Log only the run_id and decision name; never log plan content or reason
+        logger.info(
+            "NoOpPlanResumer: No agent layer wired. Run %s decision '%s' not forwarded.",
+            run_id,
+            decision.value,
+        )
+
+
+async def resume_plan_background_task(
+    run_id: UUID,
+    decision: PlanDecision,
+    resumer: PlanResumer,
+    store: object,
+) -> None:
+    """Safely call the plan resumer in the background.
+
+    WHY THIS WRAPPER IS NEEDED:
+    Same reason as run_agent_background_task — background tasks run outside
+    the HTTP cycle. If the resumer raises, we catch it, log only the run_id
+    (never the decision reason or plan content), and mark the run failed so
+    the frontend can show a meaningful error. The server process is never
+    crashed by agent-layer exceptions.
+    """
+    try:
+        await resumer.resume(run_id, decision)
+    except Exception:
+        # Log only the run_id; never log decision reason, plan content, or traces
+        logger.error("Plan resume for run %s failed", run_id)
+        if hasattr(store, "update_run"):
+            await store.update_run(
+                run_id,
+                status=RunStatus.failed,
+                error="Failed to resume agent run",
             )

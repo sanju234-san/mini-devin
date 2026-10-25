@@ -26,6 +26,7 @@ from typing import Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 from app.models.artifact import ArtifactOut, ArtifactType
+from app.models.plan import PlanDecision, PlanDecisionRecord
 from app.models.run import (
     IssueIn,
     IssueRef,
@@ -44,6 +45,23 @@ EVICTION_STATUSES = frozenset({
 
 # Maximum allowed length for GitHub delivery IDs (longer tokens are ignored)
 MAX_DELIVERY_ID_LENGTH = 128
+
+
+class PlanDecisionOutcome(str):
+    """Result code returned by claim_plan_decision.
+
+    Using plain string constants (not an Enum) so callers can compare with
+    simple equality without importing an Enum class.
+
+    OK:        Decision was accepted; the run status has been updated.
+    NOT_FOUND: No run with that ID exists.
+    CONFLICT:  The run exists but is not in awaiting_plan_approval status
+               (either wrong current status, or decision already recorded).
+    """
+
+PlanDecisionOutcome.OK = "ok"
+PlanDecisionOutcome.NOT_FOUND = "not_found"
+PlanDecisionOutcome.CONFLICT = "conflict"
 
 
 @runtime_checkable
@@ -124,6 +142,20 @@ class RunStore(Protocol):
         """Map a GitHub delivery ID to a run ID for deduplication."""
         ...
 
+    async def claim_plan_decision(
+        self,
+        run_id: UUID,
+        decision: PlanDecision,
+        reason: str | None,
+        edited_plan_content: str | None,
+    ) -> tuple[str, RunSummary | None]:
+        """Atomically claim the plan decision for a run.
+
+        Returns (outcome, RunSummary | None) where outcome is one of
+        PlanDecisionOutcome.OK, NOT_FOUND, or CONFLICT.
+        """
+        ...
+
 
 class InMemoryRunStore:
     """Thread-safe, in-memory implementation of the RunStore protocol.
@@ -140,6 +172,8 @@ class InMemoryRunStore:
         self._artifacts: dict[UUID, dict[UUID, tuple[ArtifactOut, str]]] = {}
         # Stores delivery_id -> run_id mapping for webhook idempotency
         self._deliveries: dict[str, UUID] = {}
+        # Internal audit log of plan decisions. Never exposed via API.
+        self._decision_records: dict[UUID, PlanDecisionRecord] = {}
         # Mutex lock to guard concurrent operations in async coroutines
         self._lock = asyncio.Lock()
 
@@ -321,6 +355,44 @@ class InMemoryRunStore:
             self._runs[run_id] = updated
             return updated
 
+    def _add_artifact_unlocked(
+        self,
+        run_id: UUID,
+        artifact_type: ArtifactType,
+        name: str,
+        content: str,
+        content_type: str = "text/plain",
+        agent: str | None = None,
+        model_used: str | None = None,
+    ) -> ArtifactOut:
+        """Add an artifact WITHOUT acquiring the lock.
+
+        WHY THIS HELPER EXISTS:
+        claim_plan_decision already holds self._lock when it needs to store
+        the edited plan artifact. Calling the public add_artifact() from within
+        that context would deadlock on the same asyncio.Lock. This helper
+        performs the same logic but assumes the caller already owns the lock.
+        MUST only be called while self._lock is held.
+        """
+        artifact_id = uuid4()
+        now = datetime.now(timezone.utc)
+        size_bytes = len(content.encode("utf-8"))
+        art_out = ArtifactOut(
+            id=artifact_id,
+            run_id=run_id,
+            type=artifact_type,
+            name=name,
+            content_type=content_type,
+            size_bytes=size_bytes,
+            created_at=now,
+            agent=agent,
+            model_used=model_used,
+        )
+        if run_id not in self._artifacts:
+            self._artifacts[run_id] = {}
+        self._artifacts[run_id][artifact_id] = (art_out, content)
+        return art_out
+
     async def add_artifact(
         self,
         run_id: UUID,
@@ -335,25 +407,10 @@ class InMemoryRunStore:
         async with self._lock:
             if run_id not in self._runs:
                 raise KeyError(f"Run {run_id} not found")
-            artifact_id = uuid4()
-            now = datetime.now(timezone.utc)
-            # Calculate byte size using UTF-8 encoding
-            size_bytes = len(content.encode("utf-8"))
-            art_out = ArtifactOut(
-                id=artifact_id,
-                run_id=run_id,
-                type=artifact_type,
-                name=name,
-                content_type=content_type,
-                size_bytes=size_bytes,
-                created_at=now,
-                agent=agent,
-                model_used=model_used,
+            # Delegate to unlocked helper (we already hold the lock here)
+            return self._add_artifact_unlocked(
+                run_id, artifact_type, name, content, content_type, agent, model_used
             )
-            if run_id not in self._artifacts:
-                self._artifacts[run_id] = {}
-            self._artifacts[run_id][artifact_id] = (art_out, content)
-            return art_out
 
     async def list_artifacts(self, run_id: UUID) -> list[ArtifactOut] | None:
         """List all artifacts for a run, or None if the run does not exist."""
@@ -390,3 +447,91 @@ class InMemoryRunStore:
         """Map a GitHub delivery ID to a run ID for deduplication."""
         async with self._lock:
             self._record_delivery_unlocked(delivery_id, run_id)
+
+    async def claim_plan_decision(
+        self,
+        run_id: UUID,
+        decision: PlanDecision,
+        reason: str | None,
+        edited_plan_content: str | None,
+    ) -> tuple[str, RunSummary | None]:
+        """Atomically claim the plan decision for a run.
+
+        WHY THIS MUST BE ONE ATOMIC OPERATION:
+        Two simultaneous HTTP requests for the same run could both pass a
+        simple 'status == awaiting_plan_approval' check and both try to
+        transition the run. By doing the status CHECK and STATUS TRANSITION
+        inside a single asyncio.Lock acquisition, only the first request
+        wins. The second request will see the already-updated status and
+        receive CONFLICT.
+
+        Returns:
+            (PlanDecisionOutcome.OK, RunSummary): Decision accepted, run updated.
+            (PlanDecisionOutcome.NOT_FOUND, None): No run with this ID exists.
+            (PlanDecisionOutcome.CONFLICT, None): Run is not awaiting plan approval
+                (wrong status, or decision already made).
+        """
+        async with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                return PlanDecisionOutcome.NOT_FOUND, None
+
+            # This single status check is the atomic gate.
+            # - If status is queued or running: the run is not ready yet.
+            # - If status is running/rejected/failed after a prior decision:
+            #   the transition already happened (a previous request won the race).
+            # In all cases, any status other than awaiting_plan_approval is CONFLICT.
+            if run.status != RunStatus.awaiting_plan_approval:
+                return PlanDecisionOutcome.CONFLICT, None
+
+            now = datetime.now(timezone.utc)
+
+            # Map each decision to the appropriate new status and step label
+            if decision == PlanDecision.approve:
+                new_status = RunStatus.running
+                new_step = "plan_approved"
+            elif decision == PlanDecision.edit:
+                new_status = RunStatus.running
+                new_step = "plan_edited"
+            else:  # reject
+                new_status = RunStatus.rejected
+                new_step = "plan_rejected"
+
+            # Perform the atomic status transition
+            updated = run.model_copy(update={
+                "status": new_status,
+                "current_step": new_step,
+                "updated_at": now,
+            })
+            self._runs[run_id] = updated
+
+            # Store the internal decision audit record (never returned to callers)
+            self._decision_records[run_id] = PlanDecisionRecord(
+                decision=decision,
+                reason=reason,
+                decided_at=now,
+            )
+
+            # For 'edit': store the modified plan as a new artifact.
+            # The original plan artifact is untouched. We use the unlocked
+            # helper because we already hold self._lock.
+            if decision == PlanDecision.edit and edited_plan_content is not None:
+                self._add_artifact_unlocked(
+                    run_id=run_id,
+                    artifact_type=ArtifactType.implementation_plan,
+                    name="implementation_plan_approved",
+                    content=edited_plan_content,
+                    content_type="application/json",
+                    agent="human_review",
+                )
+
+            summary = RunSummary(
+                id=updated.id,
+                status=updated.status,
+                current_step=updated.current_step,
+                issue=updated.issue,
+                created_at=updated.created_at,
+                updated_at=updated.updated_at,
+                error=updated.error,
+            )
+            return PlanDecisionOutcome.OK, summary
