@@ -206,3 +206,80 @@ class TestLazyModuleAliases:
         import app.config as cfg
         with pytest.raises(AttributeError):
             _ = cfg.NO_SUCH_ATTRIBUTE_XYZ
+
+
+class TestSandboxSettings:
+    """Verifies defaults, bounds, and aliases for sandbox settings."""
+
+    def test_sandbox_defaults(self) -> None:
+        s = Settings(_env_file=None)
+        assert s.SANDBOX_IMAGE == "mini-devin-sandbox:py"
+        assert s.SANDBOX_BROWSER_IMAGE == "mini-devin-sandbox:browser"
+        assert s.SANDBOX_MEMORY_MB == 512
+        assert s.SANDBOX_CPUS == 1.0
+        assert s.SANDBOX_PIDS_LIMIT == 128
+        assert s.SANDBOX_TIMEOUT_SECONDS == 300
+        assert s.SANDBOX_MAX_CONCURRENT == 2
+        assert s.SANDBOX_MAX_LOG_BYTES == 1048576
+        assert s.SANDBOX_MAX_ARCHIVE_MB == 50
+
+    def test_sandbox_memory_bounds(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(SANDBOX_MEMORY_MB=127, _env_file=None)
+        with pytest.raises(ValidationError):
+            Settings(SANDBOX_MEMORY_MB=4097, _env_file=None)
+        s = Settings(SANDBOX_MEMORY_MB=1024, _env_file=None)
+        assert s.SANDBOX_MEMORY_MB == 1024
+
+    def test_sandbox_cpus_bounds(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(SANDBOX_CPUS=0.0, _env_file=None)
+        with pytest.raises(ValidationError):
+            Settings(SANDBOX_CPUS=4.1, _env_file=None)
+        s = Settings(SANDBOX_CPUS=2.0, _env_file=None)
+        assert s.SANDBOX_CPUS == 2.0
+
+    def test_sandbox_pids_bounds(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(SANDBOX_PIDS_LIMIT=15, _env_file=None)
+        with pytest.raises(ValidationError):
+            Settings(SANDBOX_PIDS_LIMIT=1025, _env_file=None)
+        s = Settings(SANDBOX_PIDS_LIMIT=256, _env_file=None)
+        assert s.SANDBOX_PIDS_LIMIT == 256
+
+    def test_sandbox_timeout_bounds(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(SANDBOX_TIMEOUT_SECONDS=9, _env_file=None)
+        with pytest.raises(ValidationError):
+            Settings(SANDBOX_TIMEOUT_SECONDS=1801, _env_file=None)
+        s = Settings(SANDBOX_TIMEOUT_SECONDS=60, _env_file=None)
+        assert s.SANDBOX_TIMEOUT_SECONDS == 60
+
+    def test_sandbox_concurrent_bounds(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(SANDBOX_MAX_CONCURRENT=0, _env_file=None)
+        with pytest.raises(ValidationError):
+            Settings(SANDBOX_MAX_CONCURRENT=9, _env_file=None)
+        s = Settings(SANDBOX_MAX_CONCURRENT=4, _env_file=None)
+        assert s.SANDBOX_MAX_CONCURRENT == 4
+
+    def test_sandbox_log_bytes_bounds(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(SANDBOX_MAX_LOG_BYTES=1023, _env_file=None)
+        s = Settings(SANDBOX_MAX_LOG_BYTES=2048, _env_file=None)
+        assert s.SANDBOX_MAX_LOG_BYTES == 2048
+
+    def test_sandbox_archive_mb_bounds(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(SANDBOX_MAX_ARCHIVE_MB=0, _env_file=None)
+        with pytest.raises(ValidationError):
+            Settings(SANDBOX_MAX_ARCHIVE_MB=501, _env_file=None)
+        s = Settings(SANDBOX_MAX_ARCHIVE_MB=100, _env_file=None)
+        assert s.SANDBOX_MAX_ARCHIVE_MB == 100
+
+    def test_sandbox_aliases(self) -> None:
+        import app.config as cfg
+        get_settings.cache_clear()
+        assert cfg.SANDBOX_IMAGE == "mini-devin-sandbox:py"
+        assert cfg.SANDBOX_MEMORY_MB == 512
+

@@ -98,6 +98,17 @@ class Settings(BaseSettings):
     MAX_RETRY_ATTEMPTS: int = Field(default=3, ge=1, le=10)
     SANDBOX_BACKEND: Literal["docker", "e2b"] = "docker"
 
+    # ── Sandbox execution settings (ephemeral containers) ────────────
+    SANDBOX_IMAGE: str = "mini-devin-sandbox:py"
+    SANDBOX_BROWSER_IMAGE: str = "mini-devin-sandbox:browser"
+    SANDBOX_MEMORY_MB: int = Field(default=512, ge=128, le=4096)
+    SANDBOX_CPUS: float = Field(default=1.0, gt=0.0, le=4.0)
+    SANDBOX_PIDS_LIMIT: int = Field(default=128, ge=16, le=1024)
+    SANDBOX_TIMEOUT_SECONDS: int = Field(default=300, ge=10, le=1800)
+    SANDBOX_MAX_CONCURRENT: int = Field(default=2, ge=1, le=8)
+    SANDBOX_MAX_LOG_BYTES: int = Field(default=1048576, ge=1024)
+    SANDBOX_MAX_ARCHIVE_MB: int = Field(default=50, ge=1, le=500)
+
 
 @functools.lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -126,6 +137,15 @@ _SECRET_ALIASES = frozenset({
 _PLAIN_ALIASES = frozenset({
     "MAX_RETRY_ATTEMPTS",
     "SANDBOX_BACKEND",
+    "SANDBOX_IMAGE",
+    "SANDBOX_BROWSER_IMAGE",
+    "SANDBOX_MEMORY_MB",
+    "SANDBOX_CPUS",
+    "SANDBOX_PIDS_LIMIT",
+    "SANDBOX_TIMEOUT_SECONDS",
+    "SANDBOX_MAX_CONCURRENT",
+    "SANDBOX_MAX_LOG_BYTES",
+    "SANDBOX_MAX_ARCHIVE_MB",
 })
 
 

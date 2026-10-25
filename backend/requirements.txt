@@ -3,7 +3,7 @@ uvicorn[standard]
 langgraph
 langchain
 faiss-cpu
-docker
+docker>=7.1.0
 e2b
 playwright
 mlflow
