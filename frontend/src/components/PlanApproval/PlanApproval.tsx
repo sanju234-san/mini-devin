@@ -6,7 +6,7 @@ import type {
   SimulatorState,
   ApprovalDecision,
 } from './types';
-import { SYNTHETIC_PREVIEW_PLAN } from './planApprovalUtils';
+import { SYNTHETIC_PREVIEW_PLAN, normalizePlanData } from './planApprovalUtils';
 import { getPlan, approvePlan, rejectPlan, getRunById } from '../../services/api';
 import type { ApiError } from '../../services/types';
 import { useAgentRunSocket } from '../../hooks/useAgentRunSocket';
@@ -62,7 +62,7 @@ export const PlanApproval: React.FC<PlanApprovalProps> = ({ runId = 'sample-run'
 
       // 2. Fetch Plan
       const planData = await getPlan(runId);
-      setPlan(planData);
+      setPlan(normalizePlanData(planData));
     } catch (err) {
       setError(err as ApiError);
       setPlan(null);

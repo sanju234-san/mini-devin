@@ -59,7 +59,10 @@ export const AppShell: React.FC<AppShellProps> = ({
       {/* Main Container */}
       <div className="flex-1 flex flex-col min-w-0 lg:pl-64">
         {/* Top Header */}
-        <Header onToggleMobileSidebar={() => setMobileSidebarOpen((prev) => !prev)} />
+        <Header
+          activeNav={activeNav}
+          onToggleMobileSidebar={() => setMobileSidebarOpen((prev) => !prev)}
+        />
 
         {/* Content Area */}
         <main className="w-full pt-14 flex-1 bg-surface-container-lowest overflow-x-hidden">

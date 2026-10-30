@@ -1,3 +1,4 @@
+@import 'xterm/css/xterm.css';
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -15,5 +16,39 @@
     -moz-osx-font-smoothing: grayscale;
     margin: 0;
     padding: 0;
+  }
+
+  /* Accessibility: High-contrast focus indicators for keyboard navigation */
+  :focus-visible {
+    outline: 2px solid #4d8eff !important;
+    outline-offset: 2px !important;
+  }
+
+  /* Accessibility: Honor reduced-motion preferences */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+
+  /* Consistent sleek dark scrollbars across viewports */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #0d141d;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #2e353f;
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #424754;
   }
 }  

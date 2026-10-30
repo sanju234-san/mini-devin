@@ -18,18 +18,33 @@ export type SocketConnectionState =
 export type SocketReadyState = 0 | 1 | 2 | 3;
 
 /**
- * CONTRACT GAP — PENDING SANJEEVNI SPECIFICATION
- * Event envelope schema is not yet defined in docs/api-contract.md.
- * Below is a non-speculative base envelope representing parsed JSON events.
+ * Dual-compatible event envelope representing both legacy camelCase
+ * and Sanjeevni's authoritative StepEvent schema (docs/design/schemas.md §4).
  */
 export interface AgentEventEnvelope {
   id?: string;
+  event_id?: string;
   eventType?: string;
+  event_type?: string;
   runId?: string;
+  run_id?: string;
   agent?: string;
   step?: string | number;
   tool?: string;
+  tool_name?: string;
   model?: string;
+  model_info?: {
+    kind?: string;
+    name?: string;
+    provider?: string;
+    tier?: string;
+  };
+  tokens?: {
+    input_tokens?: number;
+    output_tokens?: number;
+  };
+  message?: string;
+  plan_version_id?: string;
   timestamp?: string;
   payload?: unknown;
   raw?: unknown;

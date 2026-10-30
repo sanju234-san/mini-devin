@@ -145,3 +145,87 @@ export const SYNTHETIC_PREVIEW_PLAN: ImplementationPlanData = {
     category: 'Stream Parser Bug',
   },
 };
+
+/**
+ * Normalizes incoming Plan payload from backend/LangGraph.
+ * Seamlessly adapts Sanjeevni's authoritative Plan schema (docs/design/schemas.md §1)
+ * while preserving frontend-native ImplementationPlanData structures.
+ */
+export function normalizePlanData(raw: any): ImplementationPlanData {
+  if (!raw || typeof raw !== 'object') {
+    return raw;
+  }
+
+  const version = raw.version || raw.version_id || 'v1';
+  const isDraft = raw.isDraft ?? (raw.status === 'draft' || raw.status === undefined);
+  const sandboxed = raw.sandboxed ?? true;
+  const rationale = raw.rationale || raw.scope || 'Plan synthesized by Planner Agent.';
+
+  // Normalize Issue Context
+  const issue = raw.issue || {
+    title: raw.intent || 'Synthesized Implementation Plan',
+    description: raw.scope || raw.rationale || '',
+    priority: 'NORMAL',
+    labels: Array.isArray(raw.requirements)
+      ? raw.requirements.map((r: any) => r.id || 'REQ')
+      : ['plan'],
+  };
+
+  // Normalize Affected Files
+  let affectedFiles = raw.affectedFiles;
+  if (!affectedFiles && Array.isArray(raw.affected_files)) {
+    affectedFiles = raw.affected_files.map((item: any) => {
+      if (typeof item === 'string') {
+        return {
+          path: item,
+          status: 'MODIFIED' as const,
+          targetScope: 'Affected by plan',
+        };
+      }
+      return item;
+    });
+  }
+
+  // Normalize Steps
+  let steps = raw.steps;
+  if (Array.isArray(steps)) {
+    steps = steps.map((s: any, idx: number) => ({
+      stepNumber: s.stepNumber ?? idx + 1,
+      title: s.title || s.description || `Step ${idx + 1}`,
+      targetFile: s.targetFile || (Array.isArray(s.files) ? s.files[0] : undefined),
+      directive: s.directive || s.description,
+      action: s.action || 'Execute step',
+      technicalImpact: s.technicalImpact,
+      lineRange: s.lineRange,
+    }));
+  } else {
+    steps = [];
+  }
+
+  // Normalize Verification Gates
+  let verificationGates = raw.verificationGates;
+  if (!verificationGates && Array.isArray(raw.expected_tests)) {
+    verificationGates = raw.expected_tests.map((cmd: any) => ({
+      command: typeof cmd === 'string' ? cmd : String(cmd),
+      description: 'Planned test suite verification',
+      status: 'PLANNED' as const,
+    }));
+  }
+
+  return {
+    version,
+    isDraft,
+    sandboxed,
+    rationale,
+    steps,
+    affectedFiles,
+    risks: raw.risks || [],
+    verificationGates,
+    metadata: raw.metadata || {
+      plannerModel: 'Autonomous Planner',
+      agent: raw.author || 'Planner',
+      version,
+    },
+    issue,
+  };
+}

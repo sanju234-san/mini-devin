@@ -168,6 +168,16 @@ export function useAgentRunSocket(
             const json = JSON.parse(messageEvent.data);
             parsed = {
               ...json,
+              id: json.id || json.event_id,
+              event_id: json.event_id || json.id,
+              runId: json.runId || json.run_id,
+              run_id: json.run_id || json.runId,
+              eventType: json.eventType || json.event_type,
+              event_type: json.event_type || json.eventType,
+              tool: json.tool || json.tool_name,
+              tool_name: json.tool_name || json.tool,
+              model: json.model || json.model_info?.name,
+              message: json.message || (typeof json.payload === 'string' ? json.payload : undefined),
               timestamp: json.timestamp || now,
               raw: json,
             };

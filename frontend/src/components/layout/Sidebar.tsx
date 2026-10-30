@@ -8,6 +8,7 @@ import {
   ScienceIcon,
   FolderZipIcon,
   MonitoringIcon,
+  EyeIcon,
 } from '../icons/Icons';
 
 interface SidebarProps {
@@ -51,25 +52,31 @@ export const Sidebar: React.FC<SidebarProps> = ({
       id: 'diff-viewer',
       label: 'Diff Viewer',
       icon: <DiffIcon className="w-[18px] h-[18px]" />,
-      isSupported: false,
+      isSupported: true,
     },
     {
       id: 'tests-and-preview',
       label: 'Tests & Preview',
       icon: <ScienceIcon className="w-[18px] h-[18px]" />,
-      isSupported: false,
+      isSupported: true,
     },
     {
       id: 'artifacts',
       label: 'Artifacts',
       icon: <FolderZipIcon className="w-[18px] h-[18px]" />,
-      isSupported: false,
+      isSupported: true,
+    },
+    {
+      id: 'transparency',
+      label: 'Transparency',
+      icon: <EyeIcon className="w-[18px] h-[18px]" />,
+      isSupported: true,
     },
     {
       id: 'evaluation',
       label: 'Evaluation',
       icon: <MonitoringIcon className="w-[18px] h-[18px]" />,
-      isSupported: false,
+      isSupported: true,
     },
   ];
 
@@ -202,6 +209,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
               Close
             </button>
           )}
+        </div>
+        <div className="px-space-xs pt-1.5 border-t border-outline-variant/20 mt-1.5 flex items-center justify-between">
+          <span className="font-mono text-[10px] text-outline whitespace-nowrap truncate" title="Nikunj Nanda · Frontend Lead">
+            Nikunj Nanda · Frontend Lead
+          </span>
         </div>
       </div>
     </aside>
