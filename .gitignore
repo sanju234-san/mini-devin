@@ -38,3 +38,4 @@ backend/app/ml_models/artifacts/
 backend/app/ml_models/artifacts/
 backend/app/ml_models/training/data/
 *.joblib
+.next 
