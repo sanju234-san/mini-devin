@@ -110,6 +110,16 @@ class GitHubClient:
         timeout: float = 30.0,
     ):
         self._token = token or os.getenv("GITHUB_TOKEN", "")
+        if not self._token:
+            try:
+                import shutil
+                import subprocess
+                gh_bin = shutil.which("gh") or r"C:\Program Files\GitHub CLI\gh.exe"
+                out = subprocess.run([gh_bin, "auth", "token"], capture_output=True, text=True, timeout=5)
+                if out.returncode == 0 and out.stdout.strip():
+                    self._token = out.stdout.strip()
+            except Exception:
+                pass
         self.api_base_url = api_base_url.rstrip("/")
         self.timeout = timeout
         self._mock_branches: dict[str, set[str]] = {}
@@ -130,6 +140,40 @@ class GitHubClient:
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "Mini-Devin-Agent",
         }
+
+    def get_authenticated_user(self) -> str:
+        """Return username of the authenticated token."""
+        if not self._token:
+            return ""
+        try:
+            url = f"{self.api_base_url}/user"
+            with httpx.Client(timeout=self.timeout) as client:
+                resp = client.get(url, headers=self._headers(write=False))
+                if resp.status_code == 200:
+                    return resp.json().get("login", "")
+        except Exception:
+            pass
+        return ""
+
+    def ensure_fork(self, ref: GitRef) -> GitRef:
+        """Ensure a fork exists under the authenticated user's account and return fork GitRef."""
+        user = self.get_authenticated_user()
+        if not user or user.lower() == ref.owner.lower():
+            return ref
+
+        fork_url = f"{self.api_base_url}/repos/{user}/{ref.repo}"
+        with httpx.Client(timeout=self.timeout) as client:
+            resp = client.get(fork_url, headers=self._headers(write=False))
+            if resp.status_code == 200:
+                return GitRef(owner=user, repo=ref.repo, branch=ref.branch or "main")
+
+            # Fork does not exist; create it
+            create_fork_url = f"{self.api_base_url}/repos/{ref.owner}/{ref.repo}/forks"
+            fork_resp = client.post(create_fork_url, headers=self._headers(write=True))
+            if fork_resp.status_code in (200, 202):
+                return GitRef(owner=user, repo=ref.repo, branch=ref.branch or "main")
+
+        return ref
 
     def fetch_repo(self, ref: GitRef) -> str:
         """
@@ -182,7 +226,7 @@ class GitHubClient:
                 return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
             return data.get("content", "")
 
-    def create_branch(self, ref: GitRef, branch_name: str) -> bool:
+    def create_branch(self, ref: GitRef, branch_name: str, base_ref: Optional[GitRef] = None) -> bool:
         """Create a new branch from reference base. Validates branch name."""
         if not re.match(r"^[a-zA-Z0-9_\-\./]+$", branch_name):
             raise GitHubClientError(f"Invalid branch name syntax: '{branch_name}'")
@@ -201,14 +245,15 @@ class GitHubClient:
             logger.info("Mock branch '%s' created in repo '%s'", branch_name, repo_key)
             return True
 
-        # Resolve base SHA
-        base_branch = ref.branch or "main"
-        ref_url = f"{self.api_base_url}/repos/{ref.owner}/{ref.repo}/git/ref/heads/{base_branch}"
+        # Resolve base SHA from upstream base_ref if provided, or ref
+        source_ref = base_ref or ref
+        base_branch = source_ref.branch or "main"
+        ref_url = f"{self.api_base_url}/repos/{source_ref.owner}/{source_ref.repo}/git/ref/heads/{base_branch}"
         with httpx.Client(timeout=self.timeout) as client:
             resp = client.get(ref_url, headers=self._headers(write=False))
             if resp.status_code == 404:
                 # Try master
-                ref_url = f"{self.api_base_url}/repos/{ref.owner}/{ref.repo}/git/ref/heads/master"
+                ref_url = f"{self.api_base_url}/repos/{source_ref.owner}/{source_ref.repo}/git/ref/heads/master"
                 resp = client.get(ref_url, headers=self._headers(write=False))
             resp.raise_for_status()
             sha = resp.json()["object"]["sha"]

@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -48,6 +49,17 @@ from app.sandbox.models import (
 logger = logging.getLogger("mini_devin.sandbox.codespaces")
 
 
+def _resolve_gh_bin() -> str:
+    """Locate the GitHub CLI executable, checking PATH and default install locations."""
+    gh_bin = shutil.which("gh")
+    if gh_bin:
+        return gh_bin
+    default_win = r"C:\Program Files\GitHub CLI\gh.exe"
+    if os.path.exists(default_win):
+        return default_win
+    return "gh"
+
+
 class CodespacesSandboxManager(SandboxManager):
     """
     Adapter managing ephemeral sandboxes via GitHub Codespaces or isolated scratch workspaces.
@@ -61,7 +73,25 @@ class CodespacesSandboxManager(SandboxManager):
         allow_unsafe_host_execution: Optional[bool] = None,
     ):
         self._token = token or os.getenv("GITHUB_TOKEN", "")
-        self.use_cloud_codespaces = use_cloud_codespaces or (os.getenv("MINI_DEVIN_USE_CLOUD_CODESPACES", "false").lower() == "true")
+        if not self._token:
+            try:
+                res = subprocess.run([_resolve_gh_bin(), "auth", "token"], capture_output=True, text=True, timeout=5)
+                if res.returncode == 0 and res.stdout.strip():
+                    self._token = res.stdout.strip()
+            except Exception:
+                pass
+        backend_env = os.getenv("SANDBOX_BACKEND", "").lower()
+        if not backend_env:
+            try:
+                from app.config import get_settings
+                backend_env = str(get_settings().SANDBOX_BACKEND).lower()
+            except Exception:
+                backend_env = ""
+        self.use_cloud_codespaces = (
+            use_cloud_codespaces
+            or (backend_env == "codespaces")
+            or (os.getenv("MINI_DEVIN_USE_CLOUD_CODESPACES", "false").lower() == "true")
+        )
         self.api_base_url = api_base_url.rstrip("/")
 
         if allow_unsafe_host_execution is not None:
@@ -104,6 +134,23 @@ class CodespacesSandboxManager(SandboxManager):
                         raise SandboxUnavailableError(f"GitHub Codespaces API creation failed: {resp.text}")
                     data = resp.json()
                     cs_name = data.get("name", sandbox_id)
+
+                    # Poll until codespace is running and accessible (timeout 300s)
+                    poll_url = f"{self.api_base_url}/user/codespaces/{cs_name}"
+                    deadline = time.time() + 300
+                    state = data.get("state", "Provisioning")
+                    while state != "Available":
+                        if state in ("Failed", "Shutdown", "Archived"):
+                            raise SandboxUnavailableError(f"Codespace '{cs_name}' entered unrecoverable state: {state}")
+                        if time.time() > deadline:
+                            raise SandboxUnavailableError(f"Codespace '{cs_name}' provisioning timed out after 300s (state: {state})")
+                        time.sleep(5)
+                        poll_resp = client.get(poll_url, headers=headers)
+                        if poll_resp.status_code == 200:
+                            state = poll_resp.json().get("state", state)
+                        else:
+                            logger.warning("Failed to poll codespace %s status: %s", cs_name, poll_resp.status_code)
+
                     self._sandboxes[sandbox_id] = {
                         "type": "cloud",
                         "codespace_name": cs_name,
@@ -162,9 +209,29 @@ class CodespacesSandboxManager(SandboxManager):
                 applied_files.append(line[6:].strip())
 
         if info["type"] == "cloud":
-            # In live cloud Codespaces, execute git apply via Codespaces command execution
-            logger.info("Applied diff to cloud codespace '%s': %s", info["codespace_name"], applied_files)
-            return DiffApplyResponse(success=True, applied_files=applied_files)
+            cs_name = re.sub(r"[^a-zA-Z0-9_-]", "", str(info["codespace_name"]))
+            repo_ref = info.get("repo_ref", "")
+            raw_repo_name = repo_ref.split("/")[-1].split("@")[0] if repo_ref else ""
+            repo_name = re.sub(r"[^A-Za-z0-9._-]", "", raw_repo_name)
+            cd_prefix = f"cd /workspaces/{repo_name} && " if repo_name else ""
+            cmd = [_resolve_gh_bin(), "cs", "ssh", "-c", cs_name, "--", f"{cd_prefix}git apply --ignore-whitespace -"]
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    input=diff_text,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if proc.returncode != 0:
+                    err_msg = proc.stderr.strip() or proc.stdout.strip() or f"git apply failed with code {proc.returncode}"
+                    logger.error("Cloud codespace diff apply failed on '%s': %s", cs_name, err_msg)
+                    return DiffApplyResponse(success=False, error=err_msg, applied_files=[])
+                logger.info("Applied diff to cloud codespace '%s': %s", cs_name, applied_files)
+                return DiffApplyResponse(success=True, applied_files=applied_files)
+            except Exception as exc:
+                logger.exception("Failed to apply diff to cloud codespace %s: %s", cs_name, exc)
+                return DiffApplyResponse(success=False, error=str(exc), applied_files=[])
 
         # Isolated local sandbox application
         workspace = Path(info["workspace_path"])
@@ -217,16 +284,51 @@ class CodespacesSandboxManager(SandboxManager):
                 raise InvalidRequestError(f"Shell chaining characters are forbidden in argv: '{arg}'")
 
         if info["type"] == "cloud":
-            # Cloud Codespaces execution simulation
-            logger.info("Executing test in cloud codespace '%s': %s", info["codespace_name"], req.argv)
-            return TestRunResponse(
-                exit_code=0,
-                stdout="All 10 tests passed successfully in GitHub Codespace.",
-                stderr="",
-                duration_ms=120,
-                timed_out=False,
-                artifacts=["artifact://log_1"],
-            )
+            cs_name = re.sub(r"[^a-zA-Z0-9_-]", "", str(info["codespace_name"]))
+            repo_ref = info.get("repo_ref", "")
+            raw_repo_name = repo_ref.split("/")[-1].split("@")[0] if repo_ref else ""
+            repo_name = re.sub(r"[^A-Za-z0-9._-]", "", raw_repo_name)
+            cd_prefix = f"cd /workspaces/{repo_name} && " if repo_name else ""
+            cmd = [_resolve_gh_bin(), "cs", "ssh", "-c", cs_name, "--", f"{cd_prefix}{shlex.join(req.argv)}"]
+            logger.info("Executing test in cloud codespace '%s': %s", cs_name, req.argv)
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=req.timeout_seconds,
+                )
+                duration_ms = int((time.perf_counter() - start_time) * 1000)
+                stdout = proc.stdout[:MAX_OUTPUT_BYTES]
+                stderr = proc.stderr[:MAX_OUTPUT_BYTES]
+                return TestRunResponse(
+                    exit_code=proc.returncode,
+                    stdout=stdout,
+                    stderr=stderr,
+                    duration_ms=duration_ms,
+                    timed_out=False,
+                    artifacts=[f"artifact://{req.sandbox_id}/test_run", f"codespace://{cs_name}"],
+                )
+            except subprocess.TimeoutExpired as exc:
+                duration_ms = int((time.perf_counter() - start_time) * 1000)
+                return TestRunResponse(
+                    exit_code=-1,
+                    stdout=(exc.stdout or "")[:MAX_OUTPUT_BYTES] if isinstance(exc.stdout, str) else "",
+                    stderr=(exc.stderr or "Codespace command timed out")[:MAX_OUTPUT_BYTES] if isinstance(exc.stderr, str) else "Codespace command timed out",
+                    duration_ms=duration_ms,
+                    timed_out=True,
+                    artifacts=[f"artifact://{req.sandbox_id}/timeout"],
+                )
+            except Exception as exc:
+                duration_ms = int((time.perf_counter() - start_time) * 1000)
+                return TestRunResponse(
+                    exit_code=-1,
+                    stdout="",
+                    stderr=str(exc)[:MAX_OUTPUT_BYTES],
+                    duration_ms=duration_ms,
+                    timed_out=False,
+                    artifacts=[f"artifact://{req.sandbox_id}/error"],
+                )
 
         workspace = info["workspace_path"]
         if not self.allow_unsafe_host_execution:
@@ -333,6 +435,15 @@ def get_sandbox_manager(allow_unsafe_host_execution: Optional[bool] = None) -> C
     except Exception:
         current_opt_in = (os.getenv("ALLOW_UNSAFE_HOST_EXECUTION", "false").lower() == "true")
 
-    if _DEFAULT_SANDBOX_MANAGER is None or _DEFAULT_SANDBOX_MANAGER.allow_unsafe_host_execution != current_opt_in:
+    backend_env = os.getenv("SANDBOX_BACKEND", "").lower()
+    expected_cloud = (
+        (backend_env == "codespaces")
+        or (os.getenv("MINI_DEVIN_USE_CLOUD_CODESPACES", "false").lower() == "true")
+    )
+    if (
+        _DEFAULT_SANDBOX_MANAGER is None
+        or _DEFAULT_SANDBOX_MANAGER.allow_unsafe_host_execution != current_opt_in
+        or _DEFAULT_SANDBOX_MANAGER.use_cloud_codespaces != expected_cloud
+    ):
         _DEFAULT_SANDBOX_MANAGER = CodespacesSandboxManager(allow_unsafe_host_execution=current_opt_in)
     return _DEFAULT_SANDBOX_MANAGER

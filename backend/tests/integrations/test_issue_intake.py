@@ -145,11 +145,12 @@ async def test_intake_guardrails_flag_prompt_injection(fake_mcp_client):
 
 # ── Triage Regression Test ──────────────────────────────────────────────────
 
-def test_triage_uncertainty_regression():
+def test_triage_uncertainty_regression(monkeypatch: pytest.MonkeyPatch):
     """
     Regression verification that low-confidence issue predictions (< MIN_CONFIDENCE 0.60)
     fail closed with reason='triage_uncertain' and is_supported=False.
     """
+    monkeypatch.setattr("app.agents.triage.agent.classify_with_confidence", lambda _: ("bug_fix", 0.45))
     sparse_state = {
         "repo": "pallets/flask",
         "issue_title": "Fix defect reported in #12345 for pallets/flask",

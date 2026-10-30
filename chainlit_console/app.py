@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sys
 import uuid
@@ -30,51 +31,52 @@ if "app" in sys.modules and not hasattr(sys.modules["app"], "__path__"):
     del sys.modules["app"]
 
 # Python 3.14 compatibility patch for anyio / sniffio async loop and task detection
-try:
-    import asyncio
-    import sniffio
+if sys.version_info >= (3, 14):
+    try:
+        import asyncio
+        import sniffio
 
-    _orig_asyncio_current_task = asyncio.current_task
-    def _safe_asyncio_current_task(loop=None):
-        t = _orig_asyncio_current_task(loop)
-        if t is not None:
-            return t
-        try:
-            if loop is None:
-                loop = asyncio.get_running_loop()
-            tasks = [task for task in asyncio.all_tasks(loop) if not task.done()]
-            if tasks:
-                return tasks[-1]
-        except Exception:
-            pass
-        return None
-    asyncio.current_task = _safe_asyncio_current_task
+        _orig_asyncio_current_task = asyncio.current_task
+        def _safe_asyncio_current_task(loop=None):
+            t = _orig_asyncio_current_task(loop)
+            if t is not None:
+                return t
+            try:
+                if loop is None:
+                    loop = asyncio.get_running_loop()
+                tasks = [task for task in asyncio.all_tasks(loop) if not task.done()]
+                if tasks:
+                    return tasks[-1]
+            except Exception:
+                pass
+            return None
+        asyncio.current_task = _safe_asyncio_current_task
 
-    _orig_sniffio = sniffio.current_async_library
-    def _patched_sniffio():
-        try:
-            asyncio.get_running_loop()
-            return "asyncio"
-        except RuntimeError:
-            pass
-        return _orig_sniffio()
-    sniffio.current_async_library = _patched_sniffio
+        _orig_sniffio = sniffio.current_async_library
+        def _patched_sniffio():
+            try:
+                asyncio.get_running_loop()
+                return "asyncio"
+            except RuntimeError:
+                pass
+            return _orig_sniffio()
+        sniffio.current_async_library = _patched_sniffio
 
-    import anyio._core._eventloop as _anyio_el
-    _orig_anyio = _anyio_el.current_async_library
-    def _patched_anyio():
-        try:
-            asyncio.get_running_loop()
-            return "asyncio"
-        except RuntimeError:
-            pass
-        return _orig_anyio()
-    _anyio_el.current_async_library = _patched_anyio
+        import anyio._core._eventloop as _anyio_el
+        _orig_anyio = _anyio_el.current_async_library
+        def _patched_anyio():
+            try:
+                asyncio.get_running_loop()
+                return "asyncio"
+            except RuntimeError:
+                pass
+            return _orig_anyio()
+        _anyio_el.current_async_library = _patched_anyio
 
-    import anyio._backends._asyncio as _anyio_aio
-    _anyio_aio.current_task = _safe_asyncio_current_task
-except Exception as _patch_err:
-    pass
+        import anyio._backends._asyncio as _anyio_aio
+        _anyio_aio.current_task = _safe_asyncio_current_task
+    except Exception as _patch_err:
+        pass
 
 import chainlit as cl
 from langgraph.types import Command
@@ -457,7 +459,19 @@ async def on_message(message: cl.Message):
         )
         short_hash = plan_hash[:8] if plan_hash else "unfrozen"
 
-        # Handle Out-of-Scope or safe-stop termination
+        # Handle Out-of-Scope, safe-stop termination, or workflow failure
+        if workflow_status == "failed":
+            err_msg = state_values.get("error") or "An error occurred during workflow execution."
+            await cl.Message(
+                content=(
+                    f"🛑 **Workflow Safely Halted: Execution Failed**\n\n"
+                    f"- **Status:** `FAILED`\n"
+                    f"- **Error:** {err_msg}\n\n"
+                    f"Execution halted safely. No plan was created and no code modifications were attempted."
+                )
+            ).send()
+            return
+
         if workflow_status == "out_of_scope" or not triage.get("is_supported", True):
             reason = triage.get("reason", "Out-of-scope issue.")
             warnings_list = triage.get("warnings", [])
@@ -594,9 +608,99 @@ async def on_message(message: cl.Message):
         error_detail = final_result.get("error")
 
         if decision == "approved":
+            # 1. Test Runner verification report
+            test_res = final_result.get("test_results") or {}
+            if test_res:
+                t_passed = (
+                    test_res.get("passed", False)
+                    if isinstance(test_res, dict)
+                    else getattr(test_res, "passed", False)
+                )
+                t_total = (
+                    test_res.get("total_tests", 0)
+                    if isinstance(test_res, dict)
+                    else getattr(test_res, "total_tests", 0)
+                )
+                t_passed_count = (
+                    test_res.get("passed_tests", 0)
+                    if isinstance(test_res, dict)
+                    else getattr(test_res, "passed_tests", 0)
+                )
+                t_details = (
+                    test_res.get("details", "")
+                    if isinstance(test_res, dict)
+                    else getattr(test_res, "details", "")
+                )
+                status_badge = "PASSED ✅" if t_passed else "FAILED ❌"
+                await cl.Message(
+                    content=(
+                        f"### 🧪 Test Runner Sandbox Execution Report\n\n"
+                        f"- **Overall Status:** `{status_badge}`\n"
+                        f"- **Tests Passed:** `{t_passed_count}/{t_total}`\n"
+                        f"```text\n{t_details.strip()}\n```"
+                    )
+                ).send()
+
+            # 2. Reviewer Report (preview on right side panel and attachment)
+            review_file = final_result.get("review_report_path")
+            review_md = final_result.get("review_report_markdown")
+            if not review_md and review_file and os.path.exists(review_file):
+                try:
+                    with open(review_file, "r", encoding="utf-8") as rf:
+                        review_md = rf.read()
+                except Exception:
+                    pass
+
+            if not review_md:
+                import glob
+                run_id_clean = (final_result.get("run_id") or run_id or "")[:10]
+                candidates = [
+                    os.path.join(os.getcwd(), "scratch", "reviews", f"review_{run_id_clean}.md"),
+                    os.path.join(os.getcwd(), "scratch", "reviews", f"review_{run_id_clean[:6]}.md"),
+                ]
+                found_files = glob.glob(os.path.join(os.getcwd(), "scratch", "reviews", "*.md"))
+                if found_files:
+                    candidates.extend(sorted(found_files, key=os.path.getmtime, reverse=True))
+                for cp in candidates:
+                    if os.path.exists(cp):
+                        try:
+                            with open(cp, "r", encoding="utf-8") as rf:
+                                review_md = rf.read()
+                            review_file = cp
+                            break
+                        except Exception:
+                            pass
+
+            if review_md:
+                try:
+                    review_element = cl.Text(
+                        name="review_report",
+                        content=review_md,
+                        display="side",
+                    )
+                    await cl.ElementSidebar.set_title("📝 Review & Verification Report")
+                    await cl.ElementSidebar.set_elements([review_element])
+                except Exception as side_err:
+                    logger.warning("Side panel review preview update skipped: %s", side_err)
+
+                review_elements = []
+                if review_file and os.path.exists(review_file):
+                    review_elements.append(cl.File(name=os.path.basename(review_file), path=review_file, display="inline"))
+
+                await cl.Message(
+                    author="📝 Reviewer Agent",
+                    content=review_md,
+                    elements=review_elements,
+                ).send()
+
+            # 3. Pull Request Submission Card
+            pr_url = final_result.get("pull_request_url")
             if final_status in ("pr_opened", "submitting_pr"):
                 msg_title = "🎉 **Pull Request Created / Prepared Successfully**"
-                handoff_text = f"- **PR Link / Artifacts:** `{final_result.get('pull_request_url', 'ready')}`"
+                if pr_url and str(pr_url).startswith("http"):
+                    handoff_text = f"### 🚀 [Click here to View Pull Request on GitHub]({pr_url})\n\n- **PR URL:** [{pr_url}]({pr_url})"
+                else:
+                    handoff_text = f"- **PR Link / Artifacts:** `{pr_url or 'ready'}`"
             elif final_status == "failed":
                 msg_title = "⚠️ **Plan Approved, but Downstream Execution Halted**"
                 handoff_text = f"- **Halt Reason:** {error_detail or 'Downstream sandbox or review verification incomplete.'}"

@@ -30,6 +30,8 @@ from app.ml_models.triage_classifier import (
     TriageModelNotFound,
     TriagePredictionError,
     classify_with_confidence,
+    extract_intent_tag,
+    preprocess_triage_text,
 )
 from app.retrieval.query_transform import clean_issue_text
 
@@ -53,6 +55,7 @@ def classify_issue(
     repo: str = "",
     issue_url: Optional[str] = None,
     issue_number: Optional[int] = None,
+    labels: Optional[list[str]] = None,
 ) -> tuple[TriageResult, str]:
     """
     Core Triage classification engine using trained classifier and input guardrails.
@@ -90,49 +93,66 @@ def classify_issue(
         )
         return result, "input_guardrail"
 
-    # 3. Clean issue text
+    # 3. Clean issue text for downstream retrieval and prepare triage input
     raw_text = f"{clean_title}\n{clean_body}".strip() if clean_body else clean_title
     cleaned_query = clean_issue_text(raw_text)
+    triage_input = preprocess_triage_text(title=clean_title, body=clean_body)
 
-    # 4. Classify using trained classifier (no LLM, no regex guess)
-    try:
-        label, confidence = classify_with_confidence(cleaned_query)
-    except TriageModelNotFound as exc:
-        logger.warning("Triage model artifact not found: %s", exc)
-        result = TriageResult(
-            classification=TriageClassification.UNSUPPORTED,
-            category=None,
-            is_supported=False,
-            confidence=0.0,
-            reason=f"Triage model unavailable: {exc}",
-            warnings=warnings + [f"Triage model not found: {exc}"],
-            cleaned_query=cleaned_query,
-        )
-        return result, "classifier"
-    except (TriagePredictionError, Exception) as exc:
-        logger.warning("Triage model prediction error: %s", exc)
-        result = TriageResult(
-            classification=TriageClassification.UNSUPPORTED,
-            category=None,
-            is_supported=False,
-            confidence=0.0,
-            reason=f"Triage prediction failed: {exc}",
-            warnings=warnings + [f"Triage prediction error: {exc}"],
-            cleaned_query=cleaned_query,
-        )
-        return result, "classifier"
+    # 4. Check explicit intent tags first (e.g. [Feature Request], [Bug])
+    tag_label, tag_conf = extract_intent_tag(clean_title, labels=labels)
+    if tag_label is not None:
+        label, confidence = tag_label, tag_conf
+    else:
+        # Classify using trained classifier (no LLM, no regex guess)
+        try:
+            label, confidence = classify_with_confidence(triage_input)
+            # If full text gives low confidence or out_of_scope, check if title alone provides a strong actionable signal
+            if (confidence < MIN_CONFIDENCE or label == "out_of_scope") and clean_title and clean_title != triage_input:
+                try:
+                    t_label, t_conf = classify_with_confidence(clean_title)
+                    if t_label != "out_of_scope" and t_conf >= MIN_CONFIDENCE:
+                        label, confidence = t_label, t_conf
+                    elif t_conf > confidence and t_label != "out_of_scope":
+                        label, confidence = t_label, t_conf
+                except Exception:
+                    pass
+        except TriageModelNotFound as exc:
+            logger.warning("Triage model artifact not found: %s", exc)
+            result = TriageResult(
+                classification=TriageClassification.UNSUPPORTED,
+                category=None,
+                is_supported=False,
+                confidence=0.0,
+                reason=f"Triage model unavailable: {exc}",
+                warnings=warnings + [f"Triage model not found: {exc}"],
+                cleaned_query=cleaned_query,
+            )
+            return result, "classifier"
+        except (TriagePredictionError, Exception) as exc:
+            logger.warning("Triage model prediction error: %s", exc)
+            result = TriageResult(
+                classification=TriageClassification.UNSUPPORTED,
+                category=None,
+                is_supported=False,
+                confidence=0.0,
+                reason=f"Triage prediction failed: {exc}",
+                warnings=warnings + [f"Triage prediction error: {exc}"],
+                cleaned_query=cleaned_query,
+            )
+            return result, "classifier"
 
     mapping = _LABEL_MAPPING.get(label, (TriageClassification.OUT_OF_SCOPE, TriageCategory.OUT_OF_SCOPE))
     classification, category = mapping
 
     # 5. Out of scope routing
     if classification == TriageClassification.OUT_OF_SCOPE:
+        reason = "triage_uncertain" if confidence < MIN_CONFIDENCE else "Issue classified as out of scope by triage classifier."
         result = TriageResult(
             classification=TriageClassification.OUT_OF_SCOPE,
             category=category,
             is_supported=False,
             confidence=confidence,
-            reason="Issue classified as out of scope by triage classifier.",
+            reason=reason,
             warnings=warnings,
             cleaned_query=cleaned_query,
         )
@@ -180,12 +200,16 @@ def triage_node(state: AgentState) -> dict[str, Any]:
 
     logger.info("Triage Agent executing [tier=%s] for repo=%s", tier.value, repo)
 
+    meta = state.get("issue_metadata")
+    labels = meta.get("labels", []) if isinstance(meta, dict) else []
+
     result, method = classify_issue(
         title=issue_title,
         body=issue_body,
         repo=repo,
         issue_url=issue_url,
         issue_number=issue_number,
+        labels=labels,
     )
 
     if not result.is_supported:

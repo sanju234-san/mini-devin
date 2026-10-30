@@ -41,3 +41,8 @@ htmlcov/
 .files/
 playground/browser_testing/artifacts/*
 !playground/browser_testing/artifacts/.gitkeep
+# Workspaces, runtime databases, and scratch
+workspaces/
+scratch/
+*.db
+

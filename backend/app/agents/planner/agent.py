@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 import re
 from typing import Any, Optional
@@ -110,7 +111,11 @@ def try_llm_plan_generation(
         )
         response = complete(prompt, agent_name="planner")
         if response and isinstance(response, str):
-            data = json.loads(response)
+            s, e = response.find("{"), response.rfind("}")
+            data = json.loads(response[s:e+1]) if (s != -1 and e != -1) else json.loads(response)
+            for step in data.get("steps", []):
+                if isinstance(step, dict) and step.get("action") not in ("create", "modify", "delete", "inspect"):
+                    step["action"] = "create" if "add" in str(step.get("action", "")) else "modify"
             data["provenance"] = "llm_generated"
             plan = ImplementationPlan.model_validate(data)
 
@@ -131,8 +136,8 @@ def try_llm_plan_generation(
 
             return plan
     except (NotImplementedError, ImportError, Exception) as exc:
-        logger.debug("LLM plan generation bypassed (shared client not implemented: %s)", exc)
-    return None
+        logger.error("LLM plan generation failed: %s", exc)
+        raise
 
 
 def synthesize_deterministic_plan(
@@ -569,14 +574,33 @@ def planner_node(state: AgentState, config: Optional[RunnableConfig] = None) -> 
     config_token = None
     if config is not None:
         config_token = var_child_runnable_config.set(config)
+    llm_error = None
     try:
         plan = try_llm_plan_generation(title=title, body=body, retrieved=retrieved_dict)
+    except Exception as exc:
+        llm_error = str(exc)
+        plan = None
     finally:
         if config_token is not None:
             var_child_runnable_config.reset(config_token)
 
     # 2. If LLM provider is unimplemented or fails, use evidence-grounded synthesizer
     if plan is None:
+        allow_fallback = state.get("allow_deterministic_fallback", False) or os.getenv("ALLOW_DETERMINISTIC_FALLBACK", "false").lower() in ("true", "1")
+        if not allow_fallback:
+            err_msg = f"Planner failed: {llm_error or 'LLM plan generation failed'}"
+            event = create_event(
+                agent_name="planner",
+                event_type="plan_generation_failed",
+                status="failed",
+                message=err_msg,
+            )
+            return {
+                "status": "failed",
+                "current_agent": "planner",
+                "error": err_msg,
+                "events": [event],
+            }
         plan = synthesize_deterministic_plan(
             title=title,
             body=body,

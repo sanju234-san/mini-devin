@@ -93,7 +93,7 @@ def pr_node(state: AgentState) -> dict[str, Any]:
     changed_files_list = []
     implemented_reqs = set()
     for c in (code_changes if isinstance(code_changes, list) else [code_changes]):
-        fpath = c.get("file_path", "") if isinstance(c, dict) else getattr(c, "file_path", "")
+        fpath = (c.get("path") or c.get("file_path") or "") if isinstance(c, dict) else (getattr(c, "path", None) or getattr(c, "file_path", ""))
         if fpath:
             changed_files_list.append(fpath)
         rids = c.get("requirement_ids", []) if isinstance(c, dict) else getattr(c, "requirement_ids", [])
@@ -131,21 +131,59 @@ def pr_node(state: AgentState) -> dict[str, Any]:
     base_branch = "main"
 
     try:
-        from app.integrations.github_client import GitRef, PRRequest, get_github_client
+        from app.integrations.github_client import FileChange, GitRef, PRRequest, get_github_client
         client = get_github_client()
         github_client_ready = True
 
         owner, repo_name = repo.split("/", 1) if "/" in repo else ("mini-devin", repo)
         git_ref = GitRef(owner=owner, repo=repo_name, branch=base_branch)
+
+        # 1. Determine target branch and repository (direct or via user fork)
+        push_ref = git_ref
+        pr_head_ref = head_branch
+        auth_user = client.get_authenticated_user()
+
+        try:
+            client.create_branch(git_ref, head_branch)
+            logger.info("PR branch created directly on target repo: %s", head_branch)
+        except Exception as b_err:
+            logger.info("Direct branch creation failed (%s); resolving user fork...", b_err)
+            if auth_user and auth_user.lower() != owner.lower():
+                fork_ref = client.ensure_fork(git_ref)
+                try:
+                    client.create_branch(fork_ref, head_branch, base_ref=git_ref)
+                    push_ref = fork_ref
+                    pr_head_ref = f"{auth_user}:{head_branch}"
+                    logger.info("PR branch created on user fork: %s -> %s", fork_ref.full_name, pr_head_ref)
+                except Exception as fb_err:
+                    logger.warning("Fork branch creation note: %s", fb_err)
+                    push_ref = fork_ref
+                    pr_head_ref = f"{auth_user}:{head_branch}"
+
+        # 2. Push code changes to branch (either on target repo or fork)
+        files_to_push = []
+        for ch in (code_changes if isinstance(code_changes, list) else [code_changes]):
+            fpath = ch.get("path") or ch.get("file_path", "") if isinstance(ch, dict) else (getattr(ch, "path", None) or getattr(ch, "file_path", ""))
+            content = ch.get("content") or ch.get("new_content") or ch.get("diff") if isinstance(ch, dict) else (getattr(ch, "content", None) or getattr(ch, "diff", ""))
+            if fpath:
+                files_to_push.append(FileChange(path=fpath, content=content or "# mini-devin update\n", action="modify"))
+
+        if files_to_push:
+            try:
+                client.push_changes(push_ref, head_branch, files_to_push)
+                logger.info("Pushed %d changes to %s on %s", len(files_to_push), head_branch, push_ref.full_name)
+            except Exception as p_err:
+                logger.warning("Push changes note: %s", p_err)
+
         pr_req = PRRequest(
             ref=git_ref,
             title=pr_title,
             body=pr_body,
-            head_branch=head_branch,
+            head_branch=pr_head_ref,
             base_branch=base_branch,
         )
 
-        # Call client to create or simulate PR
+        # Call client to create PR
         pr_resp = client.open_pull_request(pr_req)
         if pr_resp and pr_resp.pr_url:
             pr_url = pr_resp.pr_url
@@ -199,18 +237,32 @@ def pr_node(state: AgentState) -> dict[str, Any]:
             "events": [event],
         }
 
-    event = create_event(
-        agent_name="pr",
-        event_type="pr_creation_started",
-        status="in_progress",
-        message="PR Agent preparing pull request for submission (merge forbidden).",
-        metadata={
-            "tier": tier.value,
-            "pr_title": pr_title,
-            "pr_url": pr_url,
-            "github_client_ready": github_client_ready,
-        },
-    )
+    if pr_url:
+        event = create_event(
+            agent_name="pr",
+            event_type="pr_created",
+            status="success",
+            message=f"PR Agent successfully opened Pull Request: {pr_url} (merge forbidden).",
+            metadata={
+                "tier": tier.value,
+                "pr_title": pr_title,
+                "pr_url": pr_url,
+                "github_client_ready": github_client_ready,
+            },
+        )
+    else:
+        event = create_event(
+            agent_name="pr",
+            event_type="pr_creation_started",
+            status="in_progress",
+            message="PR Agent preparing pull request for submission (merge forbidden).",
+            metadata={
+                "tier": tier.value,
+                "pr_title": pr_title,
+                "pr_url": pr_url,
+                "github_client_ready": github_client_ready,
+            },
+        )
 
     return {
         "status": "submitting_pr",

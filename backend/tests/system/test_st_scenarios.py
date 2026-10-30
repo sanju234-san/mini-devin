@@ -39,6 +39,11 @@ from app.integrations.llm_provider_client import complete, AllProvidersExhausted
 
 
 @pytest.fixture(autouse=True)
+def enable_deterministic_fallback_for_st(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ALLOW_DETERMINISTIC_FALLBACK", "true")
+
+
+@pytest.fixture(autouse=True)
 def mock_triage_for_st(monkeypatch: pytest.MonkeyPatch):
     """Ensure predictable triage classification for ST runs."""
     def _mock_classify(text: str) -> tuple[str, float]:
@@ -239,7 +244,10 @@ def test_st07_sandbox_security_and_timeout():
 
 # ── ST-08: Provider Fallback & Exhaustion ────────────────────────────────
 def test_st08_provider_fallback_exhaustion():
-    with patch.dict(os.environ, {"GROQ_API_KEY": "", "GOOGLE_AI_STUDIO_API_KEY": "", "HUGGINGFACE_API_TOKEN": ""}):
+    with patch.dict(os.environ, {"GROQ_API_KEY": "", "GOOGLE_AI_STUDIO_API_KEY": "", "HUGGINGFACE_API_TOKEN": ""}), \
+         patch("app.integrations.llm_provider_client.GROQ_API_KEY", ""), \
+         patch("app.integrations.llm_provider_client.GOOGLE_AI_STUDIO_API_KEY", ""), \
+         patch("app.integrations.llm_provider_client.HUGGINGFACE_API_TOKEN", ""):
         with pytest.raises(AllProvidersExhaustedError):
             complete("test prompt", agent_name="test")
 

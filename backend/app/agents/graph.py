@@ -79,13 +79,18 @@ def route_triage(state: AgentState) -> str:
 
 
 def safe_stop_node(state: AgentState) -> dict[str, Any]:
-    """Safe terminal node for unsupported or out-of-scope issues."""
-    triage = state.get("triage")
-    reason = "Unsupported or out-of-scope issue"
-    if isinstance(triage, dict):
-        reason = triage.get("reason", reason)
-    elif hasattr(triage, "reason"):
-        reason = triage.reason
+    """Safe terminal node for unsupported, out-of-scope, or failed issues."""
+    err = state.get("error")
+    status = state.get("status", "out_of_scope")
+    if status == "failed" and err:
+        reason = f"Workflow failed: {err}"
+    else:
+        triage = state.get("triage")
+        reason = "Unsupported or out-of-scope issue"
+        if isinstance(triage, dict):
+            reason = triage.get("reason", reason)
+        elif hasattr(triage, "reason"):
+            reason = triage.reason
 
     logger.info("Halting execution safely: %s", reason)
 
@@ -96,9 +101,13 @@ def safe_stop_node(state: AgentState) -> dict[str, Any]:
         message=f"Execution safely stopped: {reason}",
         metadata={"reason": reason},
     )
+    status = state.get("status", "out_of_scope")
+    if status != "failed":
+        status = "out_of_scope"
     return {
-        "status": "out_of_scope",
+        "status": status,
         "current_agent": "safe_stop",
+        "error": state.get("error"),
         "events": [event],
     }
 
@@ -250,6 +259,20 @@ def human_approval_node(state: AgentState, config: Optional[RunnableConfig] = No
             "current_agent": "human_approval",
             "events": [event],
         }
+
+
+def route_planner(state: AgentState) -> str:
+    """Conditional router directing flow based on planner outcome."""
+    if state.get("status") == "failed":
+        return "safe_stop"
+    return "human_approval"
+
+
+def route_coder(state: AgentState) -> str:
+    """Conditional router directing flow based on coder outcome."""
+    if state.get("status") == "failed":
+        return "safe_stop"
+    return "test_runner"
 
 
 def route_approval(state: AgentState) -> str:
@@ -536,7 +559,14 @@ def create_workflow_graph() -> StateGraph:
     )
     builder.add_edge("safe_stop", END)
     builder.add_edge("retrieval", "planner")
-    builder.add_edge("planner", "human_approval")
+    builder.add_conditional_edges(
+        "planner",
+        route_planner,
+        {
+            "human_approval": "human_approval",
+            "safe_stop": "safe_stop",
+        },
+    )
     builder.add_conditional_edges(
         "human_approval",
         route_approval,
@@ -546,7 +576,14 @@ def create_workflow_graph() -> StateGraph:
         },
     )
     builder.add_edge("rejection_terminal", END)
-    builder.add_edge("coder", "test_runner")
+    builder.add_conditional_edges(
+        "coder",
+        route_coder,
+        {
+            "test_runner": "test_runner",
+            "safe_stop": "safe_stop",
+        },
+    )
     builder.add_conditional_edges(
         "test_runner",
         route_test_runner,

@@ -124,7 +124,7 @@ class GitHubMCPClient:
         token: Optional[str] = None,
         command: Optional[str] = None,
         args: Optional[List[str]] = None,
-        timeout_seconds: float = 30.0,
+        timeout_seconds: Optional[float] = None,
         max_retries: int = 3,
         server_params: Optional[StdioServerParameters] = None,
         session: Optional[ClientSession] = None,
@@ -140,7 +140,15 @@ class GitHubMCPClient:
             except Exception:
                 self._token = os.getenv("GITHUB_TOKEN", "")
 
-        self.timeout_seconds = timeout_seconds
+        if timeout_seconds is not None:
+            self.timeout_seconds = timeout_seconds
+        else:
+            try:
+                from app.config import get_settings
+                self.timeout_seconds = getattr(get_settings(), "GITHUB_MCP_TIMEOUT", 60.0)
+            except Exception:
+                self.timeout_seconds = float(os.getenv("GITHUB_MCP_TIMEOUT", "60.0"))
+
         self.max_retries = max(1, min(max_retries, 5))
         self._custom_session = session
         self._server_params = server_params

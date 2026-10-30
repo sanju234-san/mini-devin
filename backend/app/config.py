@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import functools
 from typing import Literal
 
@@ -84,25 +87,67 @@ class Settings(BaseSettings):
             return self.ENABLE_DOCS
         return self.ENVIRONMENT != "production"
 
-    # ── Secrets (all optional — app must start without them) ─────────
+    # ── Application Info & Version ───────────────────────────────────
+    APP_NAME: str = "Mini-Devin"
+    APP_VERSION: str = "0.1.0"
+    APP_DESCRIPTION: str = "Autonomous GitHub Issue-to-Pull-Request Multi-Agent System"
+
+    # ── LLM API Keys & Secrets ───────────────────────────────────────
     GROQ_API_KEY: SecretStr | None = None
     GOOGLE_AI_STUDIO_API_KEY: SecretStr | None = None
     HUGGINGFACE_API_TOKEN: SecretStr | None = None
+    ANTHROPIC_API_KEY: SecretStr | None = None
+    OPENAI_API_KEY: SecretStr | None = None
+    TAVILY_API_KEY: SecretStr | None = None
     GITHUB_TOKEN: SecretStr | None = None
     GITHUB_WEBHOOK_SECRET: SecretStr | None = None
 
-    # ── Optional LLM base URL ───────────────────────────────────────
-    LM_STUDIO_BASE_URL: str | None = None
+    # ── Model Configurations ─────────────────────────────────────────
+    OLLAMA_MODEL: str = "qwen2.5-coder:7b"
+    GROQ_MODEL: str = "openai/gpt-oss-120b"
+    GROQ_DEFAULT_MODEL: str = "openai/gpt-oss-120b"
+    GROQ_FALLBACK_MODEL: str = "openai/gpt-oss-20b"
+    GEMINI_MODEL: str = "gemini-1.5-pro"
+    HF_MODEL: str = "mistralai/Mistral-7B-Instruct-v0.3"
+    ANTHROPIC_MODEL: str | None = None
+    OPENAI_MODEL: str | None = None
+    EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
 
-    # ── Agent behaviour ──────────────────────────────────────────────
+    # ── External Services, Endpoints & Databases ─────────────────────
+    LM_STUDIO_BASE_URL: str | None = None
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    QDRANT_URL: str | None = "http://localhost:6333"
+    QDRANT_API_KEY: SecretStr | None = None
+    MONGO_URI: str = "mongodb://localhost:27017"
+    MONGO_PASS: SecretStr | None = None
+    MONGO_DB_NAME: str = "mini_devin"
+
+    # ── Chunking & Retrieval ─────────────────────────────────────────
+    CHUNK_SIZE: int = 50
+    CHUNK_OVERLAP: int = 10
+    RETRIEVAL_CHAR_BUDGET: int = 30000
+
+    # ── Agent Behaviour & Fallbacks ──────────────────────────────────
     MAX_RETRY_ATTEMPTS: int = Field(default=3, ge=1, le=10)
     SANDBOX_BACKEND: Literal["docker", "e2b", "codespaces"] = "docker"
-
-    # ── Security & Sandbox Execution ─────────────────────────────────
     ALLOW_UNSAFE_HOST_EXECUTION: bool = False
+    ALLOW_DETERMINISTIC_FALLBACK: bool = False
+    MINI_DEVIN_USE_CLOUD_CODESPACES: bool = False
 
     # ── GitHub MCP Server Configuration ──────────────────────────────
     GITHUB_MCP_PACKAGE: str = "@modelcontextprotocol/server-github@2025.4.8"
+    GITHUB_MCP_TIMEOUT: float = 60.0
+
+    # ── MLflow & Observability ───────────────────────────────────────
+    MLFLOW_TRACKING_URI: str = "http://localhost:5000"
+    MINI_DEVIN_MLFLOW_EXPERIMENT: str = "mini-devin-runs"
+    MINI_DEVIN_ENABLE_LOCAL_MLFLOW: bool = False
+
+    # ── Triage ML Classifier Thresholds ──────────────────────────────
+    MINI_DEVIN_MIN_CONFIDENCE: float = 0.55
+    MINI_DEVIN_MIN_MARGIN: float = 0.12
+    MINI_DEVIN_TITLE_WEIGHT: int = 3
+    MINI_DEVIN_TRIAGE_MAX_BODY_CHARS: int = 800
 
 
 @functools.lru_cache(maxsize=1)
@@ -117,23 +162,62 @@ def get_settings() -> Settings:
 
 
 # ── Lazy backward-compatible module-level aliases ────────────────────
-# Existing agent / retrieval code may import names like GITHUB_TOKEN
-# directly from app.config.  These are served lazily via __getattr__ so
-# that (a) importing app.config does not read the environment eagerly and
+# Existing agent / retrieval code may import names directly from app.config.
+# These are served lazily via __getattr__ so that:
+# (a) importing app.config does not read the environment eagerly and
 # (b) cache_clear() is respected on subsequent access.
 
 _SECRET_ALIASES = frozenset({
     "GITHUB_TOKEN",
+    "GITHUB_WEBHOOK_SECRET",
     "GROQ_API_KEY",
     "GOOGLE_AI_STUDIO_API_KEY",
     "HUGGINGFACE_API_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "TAVILY_API_KEY",
+    "QDRANT_API_KEY",
+    "MONGO_PASS",
 })
 
 _PLAIN_ALIASES = frozenset({
+    "APP_NAME",
+    "APP_VERSION",
+    "APP_DESCRIPTION",
+    "ENVIRONMENT",
+    "CORS_ALLOWED_ORIGINS",
+    "ENABLE_DOCS",
+    "OLLAMA_MODEL",
+    "GROQ_MODEL",
+    "GROQ_DEFAULT_MODEL",
+    "GROQ_FALLBACK_MODEL",
+    "GEMINI_MODEL",
+    "HF_MODEL",
+    "ANTHROPIC_MODEL",
+    "OPENAI_MODEL",
+    "EMBEDDING_MODEL",
+    "LM_STUDIO_BASE_URL",
+    "OLLAMA_BASE_URL",
+    "QDRANT_URL",
+    "MONGO_URI",
+    "MONGO_DB_NAME",
+    "CHUNK_SIZE",
+    "CHUNK_OVERLAP",
+    "RETRIEVAL_CHAR_BUDGET",
     "MAX_RETRY_ATTEMPTS",
     "SANDBOX_BACKEND",
     "ALLOW_UNSAFE_HOST_EXECUTION",
+    "ALLOW_DETERMINISTIC_FALLBACK",
+    "MINI_DEVIN_USE_CLOUD_CODESPACES",
     "GITHUB_MCP_PACKAGE",
+    "GITHUB_MCP_TIMEOUT",
+    "MLFLOW_TRACKING_URI",
+    "MINI_DEVIN_MLFLOW_EXPERIMENT",
+    "MINI_DEVIN_ENABLE_LOCAL_MLFLOW",
+    "MINI_DEVIN_MIN_CONFIDENCE",
+    "MINI_DEVIN_MIN_MARGIN",
+    "MINI_DEVIN_TITLE_WEIGHT",
+    "MINI_DEVIN_TRIAGE_MAX_BODY_CHARS",
 })
 
 
@@ -145,3 +229,4 @@ def __getattr__(name: str) -> object:
     if name in _PLAIN_ALIASES:
         return getattr(get_settings(), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+

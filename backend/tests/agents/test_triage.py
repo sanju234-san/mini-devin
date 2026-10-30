@@ -485,3 +485,26 @@ def test_output_guardrail_secret_redaction():
     assert "gsk_" not in sanitized
     assert "ghp_" not in sanitized
     assert "[REDACTED_SECRET]" in sanitized
+
+
+# ── 18. Issue #431 & Intent Tag / Ambiguity Tests ───────────────────
+
+def test_issue_431_routes_to_feature_request():
+    """Issue #431 with [Feature Request] tag routes cleanly to FEATURE."""
+    title = "[Feature Request]: Add CSV/Excel import validation with error reporting — current bulk upload silently skips malformed rows"
+    body = "Summary\nPuduCan supports bulk patient data import via CSV/Excel upload...\n```python\nsample = True\n```\n- [ ] checklist item"
+    result, method = classify_issue(title=title, body=body, repo="PUDUCAN-JIPMER/puducan-jipmer")
+    assert result.classification == TriageClassification.FEATURE
+    assert result.category == TriageCategory.SMALL_FEATURE
+    assert result.is_supported is True
+    assert result.confidence >= 0.60
+
+
+def test_truly_ambiguous_issue_halts_as_uncertain(monkeypatch: pytest.MonkeyPatch):
+    """Diffuse topics without intent tag or confidence margin halt safely with triage_uncertain."""
+    monkeypatch.setattr("app.agents.triage.agent.extract_intent_tag", lambda *args, **kwargs: (None, 0.0))
+    monkeypatch.setattr("app.agents.triage.agent.classify_with_confidence", lambda _: ("small_feature", 0.38))
+    title = "Some ambiguous issue with generic keywords"
+    result, method = classify_issue(title=title, body="Generic behavior noted occasionally.", repo="org/repo")
+    assert result.is_supported is False
+    assert result.reason == "triage_uncertain"

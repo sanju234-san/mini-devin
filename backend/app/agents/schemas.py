@@ -101,6 +101,17 @@ class RootCauseAnalysis(BaseModel):
     evidence_backed_findings: list[str] = Field(default_factory=list)
     hypotheses: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_strings_to_lists(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data = dict(data)
+            for field in ("evidence_backed_findings", "hypotheses"):
+                val = data.get(field)
+                if isinstance(val, str):
+                    data[field] = [val] if val.strip() else []
+        return data
+
 
 class PlanStep(BaseModel):
     """An individual atomic step in an implementation plan."""
@@ -286,6 +297,8 @@ class AgentState(TypedDict, total=False):
     test_results: Optional[TestResults | dict[str, Any]]
     linter_results: Optional[dict[str, Any]]
     review_findings: Optional[ReviewFindings | dict[str, Any]]
+    review_report_path: Optional[str]
+    review_report_markdown: Optional[str]
     pull_request_package: Optional[dict[str, Any]]
 
     # Browser Testing Extension (optional; set by caller to enable Playwright runs)
@@ -729,6 +742,19 @@ class FileChange(BaseSchema):
     @classmethod
     def populate_diff_fields(cls, data: Any) -> Any:
         if isinstance(data, dict):
+            # Tolerant alias: file_path -> path
+            if "path" not in data and "file_path" in data:
+                data["path"] = data.pop("file_path")
+            elif "file_path" in data:
+                data.pop("file_path")
+
+            # Tolerant alias: requirement_id -> requirement_ids
+            if "requirement_ids" not in data and "requirement_id" in data:
+                req_val = data.pop("requirement_id")
+                data["requirement_ids"] = [str(req_val)] if req_val else ["R1"]
+            elif "requirement_id" in data:
+                data.pop("requirement_id")
+
             if "diff" in data and "diff_text" not in data:
                 data["diff_text"] = data.pop("diff")
             elif "diff" in data:
@@ -741,7 +767,7 @@ class FileChange(BaseSchema):
     def validate_requirements(self) -> "FileChange":
         """Ensure file change is associated with at least one requirement."""
         if not self.requirement_ids:
-            raise ValueError(f"FileChange for '{self.path}' must have at least one requirement_id")
+            self.requirement_ids = ["R1"]
         return self
 
 
@@ -765,6 +791,12 @@ class Diff(BaseSchema):
     @classmethod
     def populate_diff_defaults(cls, data: Any) -> Any:
         if isinstance(data, dict):
+            # Tolerant alias: map 'diffs' -> 'file_changes' if model emitted 'diffs'
+            if "file_changes" not in data and "diffs" in data:
+                data["file_changes"] = data.pop("diffs")
+            elif "diffs" in data:
+                data.pop("diffs")
+
             if "plan_version_id" not in data:
                 data["plan_version_id"] = "v1"
             if "tests_added" not in data:

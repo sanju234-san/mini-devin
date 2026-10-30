@@ -45,6 +45,7 @@ def enable_opt_in_sandbox_for_planner_tests(monkeypatch: pytest.MonkeyPatch):
     """Enable explicit opt-in host execution for planner approval downstream tests."""
     from app.config import get_settings
     monkeypatch.setenv("ALLOW_UNSAFE_HOST_EXECUTION", "true")
+    monkeypatch.setenv("ALLOW_DETERMINISTIC_FALLBACK", "true")
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

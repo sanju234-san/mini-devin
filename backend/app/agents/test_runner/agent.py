@@ -139,11 +139,16 @@ def test_runner_node(state: AgentState) -> dict[str, Any]:
             },
         )
     else:
+        status_val = "success" if test_run_success else ("failed" if not sandbox_ready else "in_progress")
         event = create_event(
             agent_name="test_runner",
-            event_type="tests_started",
-            status="in_progress",
-            message="Test Runner executing verification test suite in sandbox.",
+            event_type="tests_completed" if test_run_success else "tests_started",
+            status=status_val,
+            message=(
+                f"Test Runner verification {'PASSED' if test_run_success else 'FAILED'} in sandbox ({test_results.passed_tests}/{test_results.total_tests} passed)."
+                if test_run_success
+                else "Test Runner executing verification test suite in sandbox."
+            ),
             metadata={
                 "sandbox_ready": sandbox_ready,
                 "passed": test_run_success,

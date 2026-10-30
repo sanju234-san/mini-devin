@@ -381,8 +381,9 @@ def test_retrieval_node_missing_checkout_truthfully_reported():
 # ... (existing content of test_langgraph_workflow_with_real_retrieval)
 # (The Edit tool will append to the end of the file)
 
-def test_langgraph_workflow_with_real_retrieval(sample_repo: Path):
+def test_langgraph_workflow_with_real_retrieval(sample_repo: Path, monkeypatch: pytest.MonkeyPatch):
     """End-to-end LangGraph run with real repository populates Planner with real files."""
+    monkeypatch.setenv("ALLOW_DETERMINISTIC_FALLBACK", "true")
     checkpointer = MemorySaver()
     graph = create_graph(checkpointer=checkpointer)
 
