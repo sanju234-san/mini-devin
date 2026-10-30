@@ -14,7 +14,6 @@ from app.agents.schemas import (
     GuardrailResult,
     Plan,
     PlanAuthor,
-    PlanStatus,
     PlanStep,
     Requirement,
     RetrievalResult,
@@ -44,6 +43,7 @@ class Scenario:
     """Per-test configuration for fake agent behaviour."""
     guardrail_flagged: bool = False
     triage_category: TriageCategory = TriageCategory.BUG_FIX
+    triage_confidence: float = 0.95
     plan_valid: list[bool] = field(default_factory=lambda: [True])
     diff_gate: list[DiffGateResult] = field(default_factory=lambda: [DiffGateResult.CLEAN])
     tests: list[TestResult] = field(default_factory=lambda: [TestResult.PASS])
@@ -59,7 +59,6 @@ def _make_plan(version_id: str, author: PlanAuthor = PlanAuthor.PLANNER) -> Plan
     return Plan(
         version_id=version_id,
         author=author,
-        status=PlanStatus.DRAFT,
         intent="Fix issue",
         scope="target module",
         non_goals="none",
@@ -125,7 +124,7 @@ def make_fake_nodes(scenario: Scenario) -> dict[str, callable]:
         return {
             "triage_result": TriageResult(
                 category=scenario.triage_category,
-                confidence=0.95,
+                confidence=scenario.triage_confidence,
                 cleaned_query="fix the bug",
             ),
             "current_step": "triage",

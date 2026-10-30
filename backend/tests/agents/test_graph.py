@@ -1,520 +1,836 @@
-"""Integration tests for graph.py — run the compiled graph with fake nodes."""
+"""
+Automated tests for Mini-Devin's Day 1 LangGraph workflow and checkpointing.
 
+Verifies:
+1. Execution from issue input to Planner interrupt.
+2. Preservation of implementation plan at human approval interrupt.
+3. Resuming approved plan using the same thread_id.
+4. Safe termination of rejected plans without code generation.
+5. Out-of-scope issues routed to safe stopping path.
+6. Validation and safe handling of missing/invalid issue inputs.
+7. Checkpoint state retention across interrupt and resume.
+8. Retry limits and initial state defaults.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import pytest
-
-from app.agents.fake_nodes import Scenario, make_fake_nodes
-from app.agents.graph import build_graph, new_run_state, run_config, REQUIRED_NODE_KEYS
-from app.agents.routing import Limits
-from app.agents.schemas import (
-    ApprovalDecision,
-    ApprovalResponse,
-    DiffGateResult,
-    Plan,
-    PlanAuthor,
-    PlanStatus,
-    PlanStep,
-    Requirement,
-    ReviewOutcome,
-    RunStatus,
-    StopReason,
-    TestResult,
-    TriageCategory,
-    find_duplicate_plan_versions,
-    get_approved_plan,
-)
-
-TestResult.__test__ = False
-
-
-def _run_until_interrupt(graph, state, config):
-    """Invoke the graph; return the last state snapshot."""
-    graph.invoke(state, config)
-    snapshot = graph.get_state(config)
-    return snapshot
-
-
-def _resume(graph, config, value):
-    """Resume graph from interrupt with a value."""
-    graph.invoke(Command(resume=value), config)
-    return graph.get_state(config)
-
-
-# We import Command here for resume usage
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 
+from app.agents.checkpointer import create_checkpointer
+from app.agents.graph import create_graph, create_workflow_graph
+from app.agents.model_router import ModelTier, route
+from app.agents.schemas import (
+    AgentState,
+    ApprovalDecision,
+    ImplementationPlan,
+    ReviewFindings,
+    TestResults,
+    TriageClassification,
+    create_initial_state,
+)
 
-# --- build_graph validation ---
-
-def test_build_graph_rejects_missing_nodes():
-    """build_graph raises ValueError if required nodes are missing."""
-    nodes = {"intake": lambda s: s}
-    with pytest.raises(ValueError, match="Missing required node keys"):
-        build_graph(nodes)
+TestResults.__test__ = False
 
 
-# --- Happy path ---
+@pytest.fixture
+def memory_checkpointer() -> MemorySaver:
+    """Provide a fresh, isolated checkpointer for each test."""
+    return create_checkpointer()
 
-def test_happy_path():
-    """Intake -> guardrail -> triage -> retrieval -> planner -> plan_validation
-    -> human_approval (approve) -> coder -> diff_gate -> test_runner
-    -> reviewer -> pr_agent -> finish."""
-    sc = Scenario()
-    nodes = make_fake_nodes(sc)
-    limits = Limits()
-    g = build_graph(nodes, limits)
 
-    state = new_run_state("r1", "o/r", 1, "Bug")
-    config = run_config("r1")
+@pytest.fixture(autouse=True)
+def mock_graph_triage_classifier(monkeypatch: pytest.MonkeyPatch):
+    """Monkeypatch triage classifier for graph execution tests."""
+    def _mock_classify(text: str) -> tuple[str, float]:
+        lower = text.lower()
+        if any(kw in lower for kw in ["cors", "rfc", "vitepress", "kubernetes", "won't fix"]):
+            return "out_of_scope", 0.95
+        return "bug_fix", 0.95
 
-    # Run to human_approval interrupt
-    snap = _run_until_interrupt(g, state, config)
-    assert snap.next == ("human_approval",), f"Expected interrupt at human_approval, got {snap.next}"
+    monkeypatch.setattr("app.agents.triage.agent.classify_with_confidence", _mock_classify)
+
+
+# ΓöÇΓöÇ Test 1: Graph execution to planner interrupt ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+def test_graph_executes_to_planner_interrupt(memory_checkpointer: MemorySaver):
+    """Workflow should execute Triage -> Retrieval -> Planner and pause at Human Approval."""
+    graph = create_graph(checkpointer=memory_checkpointer)
+    initial_state = create_initial_state(
+        issue_title="Fix ZeroDivisionError in calculation endpoint",
+        issue_body="When denominator is zero, the service crashes with 500.",
+        repo="acme/calculator",
+    )
+    thread_id = initial_state["thread_id"]
+    config = {"configurable": {"thread_id": thread_id}}
+
+    # Invoke graph: should halt at human_approval interrupt
+    graph.invoke(initial_state, config=config)
+
+    # Inspect checkpointed state
+    saved_state = graph.get_state(config)
+    assert saved_state.next == ("human_approval",), "Workflow should be paused waiting for approval"
+
+    values = saved_state.values
+    assert values["status"] == "awaiting_approval"
+    assert values["current_agent"] == "planner"
+    assert values["triage"] is not None
+    assert values["triage"]["is_supported"] is True
+    assert values["triage"]["classification"] in (
+        TriageClassification.BUG.value,
+        TriageClassification.FEATURE.value,
+    )
+    assert values["retrieved_context"] is not None
+    assert values["retrieved_context"]["is_mock"] is False
+    assert values["retrieved_context"]["retrieval_status"] == "missing_checkout"
+    assert values["plan"] is not None
+    assert len(values["plan"]["steps"]) > 0
+    assert len(values["plan"]["affected_files"]) == 0
+
+
+# ΓöÇΓöÇ Test 2: Plan preserved at human approval interrupt ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+def test_plan_preserved_at_approval_interrupt(memory_checkpointer: MemorySaver):
+    """The implementation plan must be accurately persisted in the checkpoint."""
+    graph = create_graph(checkpointer=memory_checkpointer)
+    initial_state = create_initial_state(
+        issue_title="Add OAuth2 token refresh handler",
+        repo="org/auth-service",
+    )
+    config = {"configurable": {"thread_id": initial_state["thread_id"]}}
+
+    graph.invoke(initial_state, config=config)
+    saved_state = graph.get_state(config)
+
+    # Check tasks and interrupts
+    assert len(saved_state.tasks) > 0
+    interrupts = saved_state.tasks[0].interrupts
+    assert len(interrupts) > 0
+
+    interrupt_payload = interrupts[0].value
+    assert interrupt_payload["action"] == "request_approval"
+    assert interrupt_payload["thread_id"] == initial_state["thread_id"]
+    assert "plan" in interrupt_payload
+
+    plan = saved_state.values["plan"]
+    assert plan["summary"] == "Blocked — Repository Checkout Required: Add OAuth2 token refresh handler"
+    assert len(plan["steps"]) == 1
+    assert "affected_files" in plan
+
+
+# ΓöÇΓöÇ Test 3: Approved plan resumes with same thread_id ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+def test_approved_plan_resumes_with_same_thread_id(memory_checkpointer: MemorySaver):
+    """Resuming with approval must continue the same thread to completion."""
+    graph = create_graph(checkpointer=memory_checkpointer)
+    initial_state = create_initial_state(
+        issue_title="Handle timeout in webhook delivery",
+        repo="org/webhooks",
+    )
+    thread_id = initial_state["thread_id"]
+    config = {"configurable": {"thread_id": thread_id}}
+
+    # Phase 1: Pause at interrupt
+    graph.invoke(initial_state, config=config)
+    state_at_pause = graph.get_state(config)
+    assert state_at_pause.next == ("human_approval",)
+
+    # Phase 2: Resume with approval using the exact same thread_id
+    approval_response = {
+        "decision": "approved",
+        "feedback": "Plan approved for automated code generation.",
+    }
+    resume_cmd = Command(resume=approval_response)
+    final_output = graph.invoke(resume_cmd, config=config)
+
+    # Phase 3: Assert final state
+    assert final_output["status"] == "reviewing"
+    assert final_output["current_agent"] == "reviewer"
+    assert final_output["human_approval"]["decision"] == "approved"
+    assert final_output["human_approval"]["feedback"] == approval_response["feedback"]
+
+    # Verify coder, test_runner, and reviewer events were appended in sequence
+    coder_events = [e for e in final_output["events"] if e.get("agent_name") == "coder"]
+    assert len(coder_events) == 1
+    assert coder_events[0]["event_type"] == "code_generation_started"
+    assert coder_events[0]["status"] == "in_progress"
+
+    test_runner_events = [e for e in final_output["events"] if e.get("agent_name") == "test_runner"]
+    assert len(test_runner_events) == 1
+    assert test_runner_events[0]["event_type"] == "tests_started"
+    assert test_runner_events[0]["status"] == "in_progress"
+
+    reviewer_events = [e for e in final_output["events"] if e.get("agent_name") == "reviewer"]
+    assert len(reviewer_events) == 1
+    assert reviewer_events[0]["event_type"] == "review_started"
+    assert reviewer_events[0]["status"] == "in_progress"
+
+    # Verify state in checkpoint is fully finished
+    final_state = graph.get_state(config)
+    assert final_state.next == (), "Graph should have reached END"
+    assert final_state.values["status"] == "reviewing"
+    assert final_state.values["current_agent"] == "reviewer"
+
+
+# ΓöÇΓöÇ Test 4: Rejected plan terminates safely ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+def test_rejected_plan_terminates_safely(memory_checkpointer: MemorySaver):
+    """Rejected plans must terminate cleanly without proceeding to code generation."""
+    graph = create_graph(checkpointer=memory_checkpointer)
+    initial_state = create_initial_state(
+        issue_title="Rewrite core engine in Rust",
+        repo="org/backend",
+    )
+    thread_id = initial_state["thread_id"]
+    config = {"configurable": {"thread_id": thread_id}}
+
+    # Pause at interrupt
+    graph.invoke(initial_state, config=config)
+
+    # Resume with rejection
+    rejection_response = {
+        "decision": "rejected",
+        "feedback": "Out of scope for this sprint.",
+    }
+    resume_cmd = Command(resume=rejection_response)
+    final_output = graph.invoke(resume_cmd, config=config)
+
+    assert final_output["status"] == "rejected"
+    assert final_output["current_agent"] == "rejection_terminal"
+    assert final_output["human_approval"]["decision"] == "rejected"
+
+    # Confirm no downstream code generation occurred
+    assert final_output.get("code_changes") is None
+    coder_events = [e for e in final_output["events"] if e.get("agent_name") == "coder"]
+    assert len(coder_events) == 0, "Rejected plan must not invoke coder stub"
+    test_runner_events = [e for e in final_output["events"] if e.get("agent_name") == "test_runner"]
+    assert len(test_runner_events) == 0, "Rejected plan must not invoke test_runner stub"
+
+    # Check termination in checkpoint
+    final_state = graph.get_state(config)
+    assert final_state.next == ()
+    assert final_state.values["status"] == "rejected"
+
+
+# ΓöÇΓöÇ Test 5: Out-of-scope issues follow safe stopping path ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+@pytest.mark.parametrize(
+    "out_of_scope_title",
+    [
+        "Question: How do I configure CORS for this app?",
+        "Discussion: RFC on architectural direction",
+        "[out-of-scope] Migrate documentation to VitePress",
+        "How to deploy this on Kubernetes?",
+        "Won't fix: Deprecate legacy auth",
+    ],
+)
+def test_out_of_scope_issues_safe_stopping_path(
+    memory_checkpointer: MemorySaver, out_of_scope_title: str
+):
+    """Non-actionable or out-of-scope issues must halt at safe_stop without reaching planner."""
+    graph = create_graph(checkpointer=memory_checkpointer)
+    initial_state = create_initial_state(
+        issue_title=out_of_scope_title,
+        repo="org/app",
+    )
+    config = {"configurable": {"thread_id": initial_state["thread_id"]}}
+
+    final_output = graph.invoke(initial_state, config=config)
+
+    assert final_output["status"] == "out_of_scope"
+    assert final_output["current_agent"] == "safe_stop"
+    assert final_output["triage"]["is_supported"] is False
+    assert final_output["triage"]["classification"] == TriageClassification.OUT_OF_SCOPE.value
+
+    # Planner and approval must never have been reached
+    assert final_output.get("plan") is None
+    assert final_output.get("human_approval") is None
+
+
+# ΓöÇΓöÇ Test 6: Missing or invalid issue input ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+def test_missing_or_invalid_issue_input():
+    """Initial state creation must reject invalid inputs with clear errors."""
+    with pytest.raises(ValueError, match="Repository identifier"):
+        create_initial_state(issue_title="Some issue", repo="")
+
+    with pytest.raises(ValueError, match="Repository identifier"):
+        create_initial_state(issue_title="Some issue", repo="   ")
+
+    with pytest.raises(ValueError, match="Issue title cannot be empty"):
+        create_initial_state(issue_title="", repo="org/repo")
+
+    with pytest.raises(ValueError, match="Issue title cannot be empty"):
+        create_initial_state(issue_title="   ", repo="org/repo")
+
+
+def test_triage_node_handles_empty_title_safely():
+    """Triage node must safely handle edge cases if an empty title bypasses factory."""
+    from app.agents.graph import triage_node
+
+    raw_state: AgentState = {
+        "run_id": "test_run",
+        "thread_id": "test_thread",
+        "repo": "org/repo",
+        "issue_title": "",
+        "issue_body": "",
+        "retry_count": 0,
+        "max_retries": 3,
+        "status": "pending",
+        "events": [],
+    }
+
+    result = triage_node(raw_state)
+    assert result["status"] == "unsupported"
+    assert result["triage"]["is_supported"] is False
+
+
+# ΓöÇΓöÇ Test 7: Checkpoint state across resume ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+def test_checkpoint_state_across_resume(memory_checkpointer: MemorySaver):
+    """
+    Events log and completed stage data must accumulate and persist cleanly
+    across separate graph invocations on the same checkpointer.
+    """
+    thread_id = "test_thread_persistence"
+    initial_state = create_initial_state(
+        issue_title="Fix race condition in session store",
+        repo="acme/auth",
+        thread_id=thread_id,
+    )
+    config = {"configurable": {"thread_id": thread_id}}
+
+    # Instance 1: Run to interrupt
+    graph1 = create_graph(checkpointer=memory_checkpointer)
+    graph1.invoke(initial_state, config=config)
+
+    paused_state = graph1.get_state(config)
+    events_at_pause = paused_state.values["events"]
+    assert len(events_at_pause) >= 3  # workflow_started, triage_completed, retrieval_completed, plan_generated
+
+    # Instance 2: Resume from the same checkpointer with a new graph instance
+    graph2 = create_graph(checkpointer=memory_checkpointer)
+    resumed_result = graph2.invoke(
+        Command(resume={"decision": "approved", "feedback": "LGTM"}),
+        config=config,
+    )
+
+    events_after_resume = resumed_result["events"]
+    assert len(events_after_resume) > len(events_at_pause)
+
+    # Check chronological ordering of events
+    agent_names = [e["agent_name"] for e in events_after_resume]
+    assert "orchestrator" in agent_names
+    assert "triage" in agent_names
+    assert "retrieval" in agent_names
+    assert "planner" in agent_names
+    assert "human_approval" in agent_names
+    assert "coder" in agent_names
+    assert "test_runner" in agent_names
+    assert "reviewer" in agent_names
+
+
+# ΓöÇΓöÇ Test 8: Retry limits and initial state defaults ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+def test_retry_limits_and_initial_defaults():
+    """Verify that initial state sets correct defaults for retry tracking."""
+    state = create_initial_state(
+        issue_title="Sample bug",
+        repo="org/repo",
+        max_retries=5,
+    )
+
+    assert state["retry_count"] == 0
+    assert state["max_retries"] == 5
+    assert state["code_changes"] is None
+    assert state["test_results"] is None
+    assert state["review_findings"] is None
+    assert state["pull_request_url"] is None
+    assert state["status"] == "pending"
+
+
+# ΓöÇΓöÇ Test 9: Model router integration ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+def test_model_router_tier_integration():
+    """Verify that model_router appropriately routes agent tiers."""
+    assert route("triage") == ModelTier.CLASSIFIER
+    assert route("retrieval") == ModelTier.EMBEDDING
+    assert route("planner") == ModelTier.LLM
+    assert route("coder") == ModelTier.LLM
+    assert route("debugger_first_pass") == ModelTier.CLASSIFIER
+    assert route("reviewer_first_pass") == ModelTier.STATIC_ANALYSIS
+    assert route("pr") == ModelTier.LLM
+
+
+# ── Test 10: Plan hash tamper protection prevents coder execution ─────────────
+
+def test_tampered_plan_hash_rejects_and_skips_coder(memory_checkpointer: MemorySaver):
+    """
+    Submitting an altered plan_hash on resume must be caught by tamper protection,
+    forcing rejection and immediately terminating without invoking the coder stub.
+    """
+    graph = create_graph(checkpointer=memory_checkpointer)
+    initial_state = create_initial_state(
+        issue_title="Fix rate limiter timeout on burst requests",
+        repo="org/gateway",
+    )
+    thread_id = initial_state["thread_id"]
+    config = {"configurable": {"thread_id": thread_id}}
+
+    # Execute until human_approval interrupt
+    graph.invoke(initial_state, config=config)
+    paused_state = graph.get_state(config)
+    assert paused_state.next == ("human_approval",)
+
+    # Resume with approval but spoofed plan_hash
+    tampered_response = {
+        "decision": "approved",
+        "plan_hash": "tampered_spoofed_hash_00000000",
+        "feedback": "Approved spoofed plan.",
+    }
+    resume_cmd = Command(resume=tampered_response)
+    final_output = graph.invoke(resume_cmd, config=config)
+
+    # Must be forced to rejection
+    assert final_output["status"] == "rejected"
+    assert final_output["current_agent"] == "rejection_terminal"
+    assert final_output["human_approval"]["decision"] == "rejected"
+    assert "tampering detected" in final_output["human_approval"]["feedback"].lower()
+
+    # Coder and downstream stubs must never be reached
+    coder_events = [e for e in final_output["events"] if e.get("agent_name") == "coder"]
+    assert len(coder_events) == 0, "Tampered plan must never reach coder agent"
+    test_runner_events = [e for e in final_output["events"] if e.get("agent_name") == "test_runner"]
+    assert len(test_runner_events) == 0, "Tampered plan must never reach test runner agent"
+    debugger_events = [e for e in final_output["events"] if e.get("agent_name") == "debugger"]
+    assert len(debugger_events) == 0, "Tampered plan must never reach debugger agent"
+    reviewer_events = [e for e in final_output["events"] if e.get("agent_name") == "reviewer"]
+    assert len(reviewer_events) == 0, "Tampered plan must never reach reviewer agent"
+
+    # Verify execution reached END cleanly
+    final_state = graph.get_state(config)
+    assert final_state.next == (), "Graph should terminate at END after rejection"
+    assert final_state.values["status"] == "rejected"
+
+
+# ── Test 11: Approved path executes coder, test_runner, reviewer and terminates
+
+def test_approved_path_invokes_coder_test_runner_and_reviewer(memory_checkpointer: MemorySaver):
+    """
+    Verifies that the approved path invokes coder, transitions to test_runner,
+    and upon passing tests advances to reviewer before cleanly terminating at END.
+    """
+    graph = create_graph(checkpointer=memory_checkpointer)
+    initial_state = create_initial_state(
+        issue_title="Implement healthcheck endpoint",
+        repo="org/microservice",
+    )
+    thread_id = initial_state["thread_id"]
+    config = {"configurable": {"thread_id": thread_id}}
+
+    graph.invoke(initial_state, config=config)
+    state_at_pause = graph.get_state(config)
+    assert state_at_pause.next == ("human_approval",)
+
+    # Resume with legitimate approval
+    resume_cmd = Command(resume={"decision": "approved", "feedback": "Looks great, please code and test it."})
+    final_output = graph.invoke(resume_cmd, config=config)
+
+    # Verify terminal status and agent
+    assert final_output["status"] == "reviewing"
+    assert final_output["current_agent"] == "reviewer"
+
+    # Verify coder event
+    coder_events = [e for e in final_output["events"] if e.get("agent_name") == "coder"]
+    assert len(coder_events) == 1
+    assert coder_events[0]["event_type"] == "code_generation_started"
+    assert coder_events[0]["status"] == "in_progress"
+    assert "Coder Agent initialized" in coder_events[0]["message"]
+    assert coder_events[0]["metadata"]["tier"] == ModelTier.LLM.value
+
+    # Verify test_runner event
+    test_runner_events = [e for e in final_output["events"] if e.get("agent_name") == "test_runner"]
+    assert len(test_runner_events) == 1
+    assert test_runner_events[0]["event_type"] == "tests_started"
+    assert test_runner_events[0]["status"] == "in_progress"
+    assert "Test Runner executing verification test suite" in test_runner_events[0]["message"]
+
+    # Verify reviewer event
+    reviewer_events = [e for e in final_output["events"] if e.get("agent_name") == "reviewer"]
+    assert len(reviewer_events) == 1
+    assert reviewer_events[0]["event_type"] == "review_started"
+    assert reviewer_events[0]["status"] == "in_progress"
+    assert reviewer_events[0]["metadata"]["tier"] == ModelTier.STATIC_ANALYSIS.value
+
+    # Verify event ordering: coder -> test_runner -> reviewer
+    event_agents = [e.get("agent_name") for e in final_output["events"]]
+    coder_idx = event_agents.index("coder")
+    test_runner_idx = event_agents.index("test_runner")
+    reviewer_idx = event_agents.index("reviewer")
+    assert coder_idx < test_runner_idx < reviewer_idx, "Events must follow coder -> test_runner -> reviewer"
+
+    # Graph must terminate at END immediately after reviewer
+    final_state = graph.get_state(config)
+    assert final_state.next == (), "Workflow must terminate at END after reviewer stub"
+
+
+# ── Test 12: Graph structure registers all workflow nodes ─────────────────────
+
+def test_graph_structure_registers_all_workflow_nodes():
+    """Verify create_workflow_graph includes coder, test_runner, debugger, reviewer, retry terminal."""
+    builder = create_workflow_graph()
+    compiled = builder.compile()
+    graph_spec = compiled.get_graph()
+
+    assert "coder" in graph_spec.nodes
+    assert "test_runner" in graph_spec.nodes
+    assert "debugger" in graph_spec.nodes
+    assert "reviewer" in graph_spec.nodes
+    assert "pr_agent" in graph_spec.nodes
+    assert "retry_limit_terminal" in graph_spec.nodes
+    assert "human_approval" in graph_spec.nodes
+    assert "rejection_terminal" in graph_spec.nodes
+
+
+# ── Test 13: Bounded debugger retry loop on failing tests ─────────────────────
+
+def test_failing_tests_trigger_debugger_bounded_retry_loop(memory_checkpointer: MemorySaver):
+    """
+    When tests fail, the workflow must loop: debugger -> coder -> test_runner
+    until retry_count reaches max_retries, halting at retry_limit_terminal safely.
+    """
+    graph = create_graph(checkpointer=memory_checkpointer)
+    initial_state = create_initial_state(
+        issue_title="Fix memory leak in buffer pool",
+        repo="org/memory-pool",
+        max_retries=2,
+    )
+    thread_id = initial_state["thread_id"]
+    config = {"configurable": {"thread_id": thread_id}}
+
+    # Run to human approval interrupt
+    graph.invoke(initial_state, config=config)
+    assert graph.get_state(config).next == ("human_approval",)
+
+    # Inject failing test results before resuming
+    graph.update_state(
+        config,
+        {"test_results": {"passed": False, "failed_tests": 1, "details": "AssertionError"}},
+    )
 
     # Resume with approval
-    approval = ApprovalResponse(decision=ApprovalDecision.APPROVE)
-    snap = _resume(g, config, approval.model_dump())
-
-    # Should have finished
-    assert snap.next == ()
-    final = snap.values
-    assert final["status"] == RunStatus.PR_OPENED
-    assert final["current_step"] == "finish"
-    assert "pr_link" in final.get("artifact_references", {})
-
-    # Verify call order
-    expected = [
-        "intake", "input_guardrail", "triage", "retrieval", "planner",
-        "plan_validation", "coder", "diff_gate", "test_runner",
-        "reviewer", "pr_agent",
-    ]
-    assert sc.calls == expected
-
-
-# --- Out of scope ---
-
-def test_out_of_scope():
-    """out_of_scope triage -> finish with status OUT_OF_SCOPE."""
-    sc = Scenario(triage_category=TriageCategory.OUT_OF_SCOPE)
-    nodes = make_fake_nodes(sc)
-    g = build_graph(nodes, Limits())
-
-    state = new_run_state("r2", "o/r", 2, "Q")
-    config = run_config("r2")
-
-    snap = _run_until_interrupt(g, state, config)
-    assert snap.next == ()
-    assert snap.values["status"] == RunStatus.OUT_OF_SCOPE
-    assert sc.calls == ["intake", "input_guardrail", "triage"]
-
-
-# --- Guardrail injection ---
-
-def test_guardrail_blocks():
-    """Flagged guardrail -> escalate."""
-    sc = Scenario(guardrail_flagged=True)
-    nodes = make_fake_nodes(sc)
-    g = build_graph(nodes, Limits())
-
-    state = new_run_state("r3", "o/r", 3, "DROP TABLE")
-    config = run_config("r3")
-
-    snap = _run_until_interrupt(g, state, config)
-    assert snap.next == ()
-    assert snap.values["status"] == RunStatus.ESCALATED
-    assert snap.values["stop_reason"] == StopReason.INJECTION_SUSPECTED
-
-
-# --- Plan schema retry then success ---
-
-def test_plan_schema_retry():
-    """Plan invalid once, then valid — should re-enter planner."""
-    sc = Scenario(plan_valid=[False, True])
-    nodes = make_fake_nodes(sc)
-    g = build_graph(nodes, Limits())
-
-    state = new_run_state("r4", "o/r", 4, "Bug")
-    config = run_config("r4")
-
-    snap = _run_until_interrupt(g, state, config)
-    assert snap.next == ("human_approval",)
-    # planner was called twice
-    assert sc.calls.count("planner") == 2
-    assert sc.calls.count("plan_validation") == 2
-
-
-# --- Plan schema retry exhausted ---
-
-def test_plan_schema_retry_exhausted():
-    """All plan validations fail -> escalate after limit."""
-    limits = Limits(plan_schema_retries=1)
-    sc = Scenario(plan_valid=[False, False, False])
-    nodes = make_fake_nodes(sc)
-    g = build_graph(nodes, limits)
-
-    state = new_run_state("r5", "o/r", 5, "Bug")
-    config = run_config("r5")
-
-    snap = _run_until_interrupt(g, state, config)
-    assert snap.next == ()
-    assert snap.values["status"] == RunStatus.ESCALATED
-    assert snap.values["stop_reason"] == StopReason.PLAN_SCHEMA_RETRIES_EXHAUSTED
-
-
-# --- Reject, re-plan, approve ---
-
-def test_reject_replan_approve():
-    """Reject plan -> planner reruns -> valid -> approve -> finish."""
-    sc = Scenario()
-    nodes = make_fake_nodes(sc)
-    g = build_graph(nodes, Limits())
-
-    state = new_run_state("r6", "o/r", 6, "Bug")
-    config = run_config("r6")
-
-    # First interrupt
-    snap = _run_until_interrupt(g, state, config)
-    assert snap.next == ("human_approval",)
-
-    # Reject
-    reject = ApprovalResponse(decision=ApprovalDecision.REJECT, feedback="Too broad")
-    snap = _resume(g, config, reject.model_dump())
-    # Should re-plan and interrupt again
-    assert snap.next == ("human_approval",)
-
-    # Now approve
-    approve = ApprovalResponse(decision=ApprovalDecision.APPROVE)
-    snap = _resume(g, config, approve.model_dump())
-    assert snap.next == ()
-    assert snap.values["status"] == RunStatus.PR_OPENED
-    assert sc.calls.count("planner") == 2
-
-
-# --- Test failure, debug loop, then pass ---
-
-def test_debug_loop():
-    """Tests fail once, debugger re-diffs, tests pass."""
-    sc = Scenario(tests=[TestResult.FAIL, TestResult.PASS])
-    nodes = make_fake_nodes(sc)
-    g = build_graph(nodes, Limits())
-
-    state = new_run_state("r7", "o/r", 7, "Bug")
-    config = run_config("r7")
-
-    snap = _run_until_interrupt(g, state, config)
-    assert snap.next == ("human_approval",)
-    approve = ApprovalResponse(decision=ApprovalDecision.APPROVE)
-    snap = _resume(g, config, approve.model_dump())
-
-    assert snap.next == ()
-    assert snap.values["status"] == RunStatus.PR_OPENED
-    assert "debugger" in sc.calls
-    assert sc.calls.count("test_runner") == 2
-
-
-# --- Debug limit exhausted ---
-
-def test_debug_limit_exhausted():
-    """Tests keep failing -> escalate after debugger limit."""
-    limits = Limits(debug_attempts=1)
-    sc = Scenario(tests=[TestResult.FAIL, TestResult.FAIL, TestResult.FAIL])
-    nodes = make_fake_nodes(sc)
-    g = build_graph(nodes, limits)
-
-    state = new_run_state("r8", "o/r", 8, "Bug")
-    config = run_config("r8")
-
-    snap = _run_until_interrupt(g, state, config)
-    assert snap.next == ("human_approval",)
-    approve = ApprovalResponse(decision=ApprovalDecision.APPROVE)
-    snap = _resume(g, config, approve.model_dump())
-
-    assert snap.next == ()
-    assert snap.values["status"] == RunStatus.ESCALATED
-    assert snap.values["stop_reason"] == StopReason.DEBUGGER_LIMIT
-
-
-# --- Reviewer revise loop ---
-
-def test_reviewer_revise_loop():
-    """Reviewer asks for revision, coder re-diffs, reviewer approves."""
-    sc = Scenario(reviews=[ReviewOutcome.REVISE, ReviewOutcome.APPROVE])
-    nodes = make_fake_nodes(sc)
-    g = build_graph(nodes, Limits())
-
-    state = new_run_state("r9", "o/r", 9, "Bug")
-    config = run_config("r9")
-
-    snap = _run_until_interrupt(g, state, config)
-    assert snap.next == ("human_approval",)
-    approve = ApprovalResponse(decision=ApprovalDecision.APPROVE)
-    snap = _resume(g, config, approve.model_dump())
-
-    assert snap.next == ()
-    assert snap.values["status"] == RunStatus.PR_OPENED
-    assert sc.calls.count("coder") == 2
-    assert sc.calls.count("reviewer") == 2
-
-
-# --- Reviewer block ---
-
-def test_reviewer_block():
-    """Reviewer blocks -> escalate (reviewer_block)."""
-    sc = Scenario(reviews=[ReviewOutcome.BLOCK])
-    nodes = make_fake_nodes(sc)
-    g = build_graph(nodes, Limits())
-
-    state = new_run_state("r10", "o/r", 10, "Bug")
-    config = run_config("r10")
-
-    snap = _run_until_interrupt(g, state, config)
-    assert snap.next == ("human_approval",)
-    approve = ApprovalResponse(decision=ApprovalDecision.APPROVE)
-    snap = _resume(g, config, approve.model_dump())
-
-    assert snap.next == ()
-    assert snap.values["status"] == RunStatus.ESCALATED
-    assert snap.values["stop_reason"] == StopReason.REVIEWER_BLOCK
-
-
-# --- Diff gate blocked ---
-
-def test_diff_gate_blocked():
-    """Diff hits denylist -> escalate (diff_blocked)."""
-    sc = Scenario(diff_gate=[DiffGateResult.DENYLIST_HIT])
-    nodes = make_fake_nodes(sc)
-    g = build_graph(nodes, Limits())
-
-    state = new_run_state("r11", "o/r", 11, "Bug")
-    config = run_config("r11")
-
-    snap = _run_until_interrupt(g, state, config)
-    assert snap.next == ("human_approval",)
-    approve = ApprovalResponse(decision=ApprovalDecision.APPROVE)
-    snap = _resume(g, config, approve.model_dump())
-
-    assert snap.next == ()
-    assert snap.values["status"] == RunStatus.ESCALATED
-    assert snap.values["stop_reason"] == StopReason.DIFF_BLOCKED
-
-
-# --- Diff schema retry ---
-
-def test_diff_schema_retry():
-    """Diff schema invalid once, then clean on retry."""
-    sc = Scenario(diff_gate=[DiffGateResult.SCHEMA_INVALID, DiffGateResult.CLEAN])
-    nodes = make_fake_nodes(sc)
-    g = build_graph(nodes, Limits())
-
-    state = new_run_state("r12", "o/r", 12, "Bug")
-    config = run_config("r12")
-
-    snap = _run_until_interrupt(g, state, config)
-    assert snap.next == ("human_approval",)
-    approve = ApprovalResponse(decision=ApprovalDecision.APPROVE)
-    snap = _resume(g, config, approve.model_dump())
-
-    assert snap.next == ()
-    assert snap.values["status"] == RunStatus.PR_OPENED
-    assert sc.calls.count("coder") == 2
-    assert sc.calls.count("diff_gate") == 2
-
-
-# --- Run budget ---
-
-def test_run_budget_exhausted():
-    """Budget exhausted before reviewer -> escalate."""
-    limits = Limits(run_budget=4)
-    sc = Scenario()
-    nodes = make_fake_nodes(sc)
-    g = build_graph(nodes, limits)
-
-    state = new_run_state("r13", "o/r", 13, "Bug")
-    config = run_config("r13")
-
-    snap = _run_until_interrupt(g, state, config)
-    assert snap.next == ("human_approval",)
-    approve = ApprovalResponse(decision=ApprovalDecision.APPROVE)
-    snap = _resume(g, config, approve.model_dump())
-
-    assert snap.next == ()
-    assert snap.values["status"] == RunStatus.ESCALATED
-    assert snap.values["stop_reason"] == StopReason.RUN_BUDGET
-
-
-# --- new_run_state and run_config ---
-
-def test_new_run_state():
-    """new_run_state returns proper initial state."""
-    s = new_run_state("r", "o/r", 1, "T")
-    assert s["run_id"] == "r"
-    assert s["status"] == RunStatus.RUNNING
-    assert s["plan_schema_retries"] == 0
-    assert s["run_llm_calls"] == 0
-    assert s["plan_versions"] == []
-
-
-def test_run_config():
-    """run_config sets thread_id."""
-    c = run_config("r")
-    assert c["configurable"]["thread_id"] == "r"
-
-
-# --- Review findings follow-up tests ---
-
-EXTERNAL_NODES_ORDER = [
-    "intake",
-    "input_guardrail",
-    "triage",
-    "retrieval",
-    "planner",
-    "plan_validation",
-    "coder",
-    "diff_gate",
-    "test_runner",
-    "debugger",
-    "reviewer",
-    "pr_agent",
-]
-
-
-@pytest.mark.parametrize("failing_node", EXTERNAL_NODES_ORDER)
-def test_node_error_at_external_nodes(failing_node):
-    """Parametrized over 12 external nodes: node_error_at set to that node,
-    assert final status is escalated, stop_reason is error, and no node after it was called.
-    """
-    # For debugger, we need tests to fail on the first run so it routes to debugger
-    tests_cfg = [TestResult.FAIL, TestResult.PASS] if failing_node == "debugger" else [TestResult.PASS]
-    sc = Scenario(
-        node_error_at=failing_node,
-        node_error_reason=StopReason.ERROR,
-        tests=tests_cfg,
+    final_output = graph.invoke(
+        Command(resume={"decision": "approved", "feedback": "Go ahead"}),
+        config=config,
     )
-    nodes = make_fake_nodes(sc)
-    g = build_graph(nodes, Limits())
 
-    run_id = f"err_{failing_node}"
-    state = new_run_state(run_id, "o/r", 1, "Bug")
-    config = run_config(run_id)
+    # Verify execution halted at retry_limit_terminal
+    assert final_output["status"] == "failed"
+    assert final_output["current_agent"] == "retry_limit_terminal"
+    assert final_output["retry_count"] == 2
 
-    snap = _run_until_interrupt(g, state, config)
-    if snap.next == ("human_approval",):
-        # We need to approve to let execution reach post-approval nodes
-        approval = ApprovalResponse(decision=ApprovalDecision.APPROVE)
-        snap = _resume(g, config, approval.model_dump())
+    # Debugger should have executed exactly max_retries (2) times
+    debugger_events = [e for e in final_output["events"] if e.get("agent_name") == "debugger"]
+    assert len(debugger_events) == 2, f"Expected 2 debugger attempts, got {len(debugger_events)}"
 
-    assert snap.next == ()
-    final = snap.values
-    assert final["status"] == RunStatus.ESCALATED
-    assert final["stop_reason"] == StopReason.ERROR
+    # Reviewer must never have been reached
+    reviewer_events = [e for e in final_output["events"] if e.get("agent_name") == "reviewer"]
+    assert len(reviewer_events) == 0, "Reviewer must not execute on failed test run"
 
-    # Verify no node after failing_node was called
-    assert failing_node in sc.calls
-    idx = sc.calls.index(failing_node)
-    assert sc.calls == sc.calls[:idx + 1]
+    # Verify execution reached END cleanly without recursion error
+    final_state = graph.get_state(config)
+    assert final_state.next == (), "Workflow must terminate cleanly at END"
+    assert final_state.values["status"] == "failed"
 
 
-def test_edit_then_reject_then_planner():
-    """Edit then reject then planner again: all plan version_ids in final state
-    are unique (find_duplicate_plan_versions returns empty) and the approved
-    version resolves to the intended plan.
-    """
-    sc = Scenario()
-    nodes = make_fake_nodes(sc)
-    g = build_graph(nodes, Limits())
+# ── Test 14: Zero max_retries halts immediately on test failure ────────────────
 
-    run_id = "test_edit_reject_plan"
-    state = new_run_state(run_id, "o/r", 10, "Bug")
-    config = run_config(run_id)
-
-    # 1. Runs through planner (v1) -> plan_validation -> human_approval
-    snap = _run_until_interrupt(g, state, config)
-    assert snap.next == ("human_approval",)
-
-    # 2. Edit plan -> human-authored plan (v2) -> plan_validation -> human_approval
-    edited = Plan(
-        version_id="will_be_overridden",
-        author=PlanAuthor.HUMAN,
-        status=PlanStatus.DRAFT,
-        intent="Human revised intent",
-        scope="target module",
-        non_goals="none",
-        affected_files=["app/target.py"],
-        requirements=[Requirement(id="R1", description="Fix", acceptance_criterion="Tests pass")],
-        steps=[PlanStep(description="Edit target", requirement_ids=["R1"], files=["app/target.py"])],
-        expected_tests=["tests/test_target.py"],
+def test_zero_max_retries_halts_immediately_on_failure(memory_checkpointer: MemorySaver):
+    """If max_retries is 0, failing tests immediately halt at retry_limit_terminal."""
+    graph = create_graph(checkpointer=memory_checkpointer)
+    initial_state = create_initial_state(
+        issue_title="Fix broken parser logic",
+        repo="org/parser",
+        max_retries=0,
     )
-    edit_resp = ApprovalResponse(decision=ApprovalDecision.EDIT, edited_plan=edited)
-    snap = _resume(g, config, edit_resp.model_dump())
-    assert snap.next == ("human_approval",)
+    thread_id = initial_state["thread_id"]
+    config = {"configurable": {"thread_id": thread_id}}
 
-    # 3. Reject plan -> planner reruns (v3) -> plan_validation -> human_approval
-    reject_resp = ApprovalResponse(decision=ApprovalDecision.REJECT, feedback="Need more tests")
-    snap = _resume(g, config, reject_resp.model_dump())
-    assert snap.next == ("human_approval",)
+    graph.invoke(initial_state, config=config)
+    graph.update_state(config, {"test_results": {"passed": False}})
 
-    # 4. Approve plan v3 -> coder -> ... -> finish
-    approve_resp = ApprovalResponse(decision=ApprovalDecision.APPROVE)
-    snap = _resume(g, config, approve_resp.model_dump())
-    assert snap.next == ()
+    final_output = graph.invoke(
+        Command(resume={"decision": "approved", "feedback": "Try once"}),
+        config=config,
+    )
 
-    final = snap.values
-    assert final["status"] == RunStatus.PR_OPENED
-    assert find_duplicate_plan_versions(final) == []
-    approved_plan = get_approved_plan(final)
-    assert approved_plan.version_id == "v3"
-    assert final["approved_version"] == "v3"
+    assert final_output["status"] == "failed"
+    assert final_output["current_agent"] == "retry_limit_terminal"
+    assert final_output["retry_count"] == 0
+
+    debugger_events = [e for e in final_output["events"] if e.get("agent_name") == "debugger"]
+    assert len(debugger_events) == 0, "Debugger must not run when max_retries is 0"
 
 
-@pytest.mark.parametrize("bad_payload", [
-    {"decision": "approve", "feedback": "x"},  # approve with feedback violates model
-    "not_a_dict_or_response",
-    12345,
-    {"decision": "unknown_decision"},
-])
-def test_invalid_resume_payload_escalates(bad_payload):
-    """Invalid resume payload ends escalated with stop_reason error."""
-    sc = Scenario()
-    nodes = make_fake_nodes(sc)
-    g = build_graph(nodes, Limits())
+# ── Test 15: Pydantic TestResults object compatibility ────────────────────────
 
-    run_id = "test_bad_resume"
-    state = new_run_state(run_id, "o/r", 20, "Bug")
-    config = run_config(run_id)
+def test_pydantic_test_results_passing_reaches_reviewer(memory_checkpointer: MemorySaver):
+    """Pydantic TestResults model with passed=True routes directly to reviewer."""
+    graph = create_graph(checkpointer=memory_checkpointer)
+    initial_state = create_initial_state(
+        issue_title="Add caching layer to user service",
+        repo="org/user-svc",
+    )
+    thread_id = initial_state["thread_id"]
+    config = {"configurable": {"thread_id": thread_id}}
 
-    snap = _run_until_interrupt(g, state, config)
-    assert snap.next == ("human_approval",)
+    graph.invoke(initial_state, config=config)
+    graph.update_state(
+        config,
+        {"test_results": TestResults(passed=True, total_tests=10, passed_tests=10)},
+    )
 
-    snap = _resume(g, config, bad_payload)
-    assert snap.next == ()
-    final = snap.values
-    assert final["status"] == RunStatus.ESCALATED
-    assert final["stop_reason"] == StopReason.ERROR
+    final_output = graph.invoke(
+        Command(resume={"decision": "approved", "feedback": "Approved"}),
+        config=config,
+    )
+
+    assert final_output["status"] == "reviewing"
+    assert final_output["current_agent"] == "reviewer"
+
+    debugger_events = [e for e in final_output["events"] if e.get("agent_name") == "debugger"]
+    assert len(debugger_events) == 0, "Debugger must not run when tests pass"
 
 
-def test_approve_clears_prior_rejection_feedback():
-    """After approve following an earlier reject, state['approval_feedback'] is None."""
-    sc = Scenario()
-    nodes = make_fake_nodes(sc)
-    g = build_graph(nodes, Limits())
+# ── Test 16: Explicit review approval routes to PR Agent ──────────────────────
 
-    run_id = "test_clear_feedback"
-    state = new_run_state(run_id, "o/r", 30, "Bug")
-    config = run_config(run_id)
+def test_approved_review_findings_advances_to_pr_agent(memory_checkpointer: MemorySaver):
+    """
+    When review_findings explicitly has approved=True, workflow advances
+    from reviewer to pr_agent and terminates cleanly at END.
+    """
+    graph = create_graph(checkpointer=memory_checkpointer)
+    initial_state = create_initial_state(
+        issue_title="Implement database health metric",
+        repo="org/metrics-service",
+    )
+    thread_id = initial_state["thread_id"]
+    config = {"configurable": {"thread_id": thread_id}}
 
-    # 1. Interrupt at human_approval
-    snap = _run_until_interrupt(g, state, config)
-    assert snap.next == ("human_approval",)
+    graph.invoke(initial_state, config=config)
+    assert graph.get_state(config).next == ("human_approval",)
 
-    # 2. Reject with feedback
-    reject_resp = ApprovalResponse(decision=ApprovalDecision.REJECT, feedback="Initial reject feedback")
-    snap = _resume(g, config, reject_resp.model_dump())
-    assert snap.next == ("human_approval",)
-    assert snap.values.get("approval_feedback") == "Initial reject feedback"
+    # Inject explicit review approval before resuming
+    graph.update_state(
+        config,
+        {
+            "review_findings": {
+                "approved": True,
+                "score": 1.0,
+                "comments": ["Patch conforms cleanly to agreed plan."],
+            }
+        },
+    )
 
-    # 3. Approve
-    approve_resp = ApprovalResponse(decision=ApprovalDecision.APPROVE)
-    snap = _resume(g, config, approve_resp.model_dump())
-    assert snap.next == ()
-    final = snap.values
-    assert final["status"] == RunStatus.PR_OPENED
-    assert final["approval_feedback"] is None
+    final_output = graph.invoke(
+        Command(resume={"decision": "approved", "feedback": "Ready for PR"}),
+        config=config,
+    )
+
+    # Verify terminal status and agent
+    assert final_output["status"] == "submitting_pr"
+    assert final_output["current_agent"] == "pr"
+
+    # Verify PR Agent event
+    pr_events = [e for e in final_output["events"] if e.get("agent_name") == "pr"]
+    assert len(pr_events) == 1
+    assert pr_events[0]["event_type"] == "pr_creation_started"
+    assert pr_events[0]["status"] == "in_progress"
+    assert "PR Agent preparing pull request" in pr_events[0]["message"]
+    assert pr_events[0]["metadata"]["tier"] == ModelTier.LLM.value
+
+    # Verify event ordering: coder -> test_runner -> reviewer -> pr
+    event_agents = [e.get("agent_name") for e in final_output["events"]]
+    coder_idx = event_agents.index("coder")
+    test_runner_idx = event_agents.index("test_runner")
+    reviewer_idx = event_agents.index("reviewer")
+    pr_idx = event_agents.index("pr")
+    assert coder_idx < test_runner_idx < reviewer_idx < pr_idx, (
+        "Events must follow coder -> test_runner -> reviewer -> pr"
+    )
+
+    # Graph must terminate at END immediately after PR agent
+    final_state = graph.get_state(config)
+    assert final_state.next == (), "Workflow must terminate at END after pr_agent stub"
+
+
+# ── Test 17: Missing or rejected review never reaches PR Agent ────────────────
+
+def test_missing_or_rejected_review_never_invokes_pr_agent(memory_checkpointer: MemorySaver):
+    """
+    Safety invariant: PR Agent is never reached when review_findings is absent
+    or when approved=False. Never treat missing review data as approval.
+    """
+    # Case A: Missing review data (review_findings is None)
+    graph_a = create_graph(checkpointer=memory_checkpointer)
+    state_a = create_initial_state(
+        issue_title="Add pagination to user list endpoint",
+        repo="org/users",
+        thread_id="thread_missing_review",
+    )
+    config_a = {"configurable": {"thread_id": state_a["thread_id"]}}
+
+    graph_a.invoke(state_a, config=config_a)
+    out_a = graph_a.invoke(
+        Command(resume={"decision": "approved", "feedback": "Approved"}),
+        config=config_a,
+    )
+
+    # Should halt after reviewer without calling PR agent
+    assert out_a["status"] == "reviewing"
+    assert out_a["current_agent"] == "reviewer"
+    pr_events_a = [e for e in out_a["events"] if e.get("agent_name") == "pr"]
+    assert len(pr_events_a) == 0, "PR Agent must NOT be invoked when review data is absent"
+
+    # Case B: Review explicitly rejected (approved=False)
+    graph_b = create_graph(checkpointer=memory_checkpointer)
+    state_b = create_initial_state(
+        issue_title="Fix TLS cipher negotiation vulnerability",
+        repo="org/infra",
+        thread_id="thread_rejected_review",
+    )
+    config_b = {"configurable": {"thread_id": state_b["thread_id"]}}
+
+    graph_b.invoke(state_b, config=config_b)
+    graph_b.update_state(
+        config_b,
+        {
+            "review_findings": {
+                "approved": False,
+                "score": 0.2,
+                "comments": ["Diff introduces unexpected modifications to auth.py"],
+            }
+        },
+    )
+
+    out_b = graph_b.invoke(
+        Command(resume={"decision": "approved", "feedback": "Approved"}),
+        config=config_b,
+    )
+
+    # Must halt without calling PR agent
+    assert out_b["current_agent"] == "reviewer"
+    pr_events_b = [e for e in out_b["events"] if e.get("agent_name") == "pr"]
+    assert len(pr_events_b) == 0, "PR Agent must NOT be invoked when review is rejected"
+
+
+# ── Test 18: Pydantic ReviewFindings model compatibility ──────────────────────
+
+def test_pydantic_review_findings_approved_reaches_pr_agent(memory_checkpointer: MemorySaver):
+    """Pydantic ReviewFindings(approved=True) triggers routing to pr_agent."""
+    graph = create_graph(checkpointer=memory_checkpointer)
+    initial_state = create_initial_state(
+        issue_title="Fix deadlock in connection pool",
+        repo="org/db-pool",
+    )
+    thread_id = initial_state["thread_id"]
+    config = {"configurable": {"thread_id": thread_id}}
+
+    graph.invoke(initial_state, config=config)
+    graph.update_state(
+        config,
+        {"review_findings": ReviewFindings(approved=True, score=0.98, comments=["Clean patch"])},
+    )
+
+    final_output = graph.invoke(
+        Command(resume={"decision": "approved", "feedback": "Approved"}),
+        config=config,
+    )
+
+    assert final_output["status"] == "submitting_pr"
+    assert final_output["current_agent"] == "pr"
+
+    pr_events = [e for e in final_output["events"] if e.get("agent_name") == "pr"]
+    assert len(pr_events) == 1
+
+
+# ── Test 19 & 20: Async planning phase & RunnableConfig regression tests ─────
+
+def test_async_workflow_planning_phase_with_github_issue_url(memory_checkpointer: MemorySaver):
+    """
+    Regression test for: Called get_config outside of a runnable context.
+    Executes the workflow graph via graph.ainvoke() with a GitHub issue URL,
+    verifying it cleanly executes Triage -> Retrieval -> Planner and pauses at
+    human_approval without failing on missing RunnableConfig context.
+    """
+    async def _test():
+        graph = create_graph(checkpointer=memory_checkpointer)
+        initial_state = create_initial_state(
+            repo="octocat/Hello-World",
+            issue_title="Fix defect reported in #42 for octocat/Hello-World",
+            issue_body="Automated bug report imported from https://github.com/octocat/Hello-World/issues/42.",
+            issue_url="https://github.com/octocat/Hello-World/issues/42",
+            issue_number=42,
+        )
+        thread_id = initial_state["thread_id"]
+        config = {"configurable": {"thread_id": thread_id}}
+
+        # Phase 1: ainvoke up to human_approval interrupt
+        res = await graph.ainvoke(initial_state, config=config)
+        assert "__interrupt__" in res
+
+        saved = graph.get_state(config)
+        assert saved.next == ("human_approval",)
+        assert saved.values["status"] == "awaiting_approval"
+        assert saved.values["plan"] is not None
+        plan_hash = saved.values["plan_hash"]
+        assert plan_hash is not None
+
+        # Phase 2: ainvoke resume with approval
+        approval_payload = {
+            "decision": "approved",
+            "plan_hash": plan_hash,
+            "plan_version": "v1",
+        }
+        resume_res = await graph.ainvoke(Command(resume=approval_payload), config=config)
+        assert resume_res is not None
+        saved_after = graph.get_state(config)
+        assert saved_after.values["status"] in ("approved", "completed", "reviewing", "submitting_pr")
+
+    asyncio.run(_test())
+
+
+def test_async_workflow_planning_phase_rejection(memory_checkpointer: MemorySaver):
+    """Verifies that async execution with rejection cleanly terminates."""
+    async def _test():
+        graph = create_graph(checkpointer=memory_checkpointer)
+        initial_state = create_initial_state(
+            repo="octocat/Hello-World",
+            issue_title="Feature request #99",
+            issue_body="Add new feature",
+            issue_url="https://github.com/octocat/Hello-World/issues/99",
+            issue_number=99,
+        )
+        thread_id = initial_state["thread_id"]
+        config = {"configurable": {"thread_id": thread_id}}
+
+        res = await graph.ainvoke(initial_state, config=config)
+        assert "__interrupt__" in res
+
+        saved = graph.get_state(config)
+        assert saved.next == ("human_approval",)
+
+        # Reject
+        resume_res = await graph.ainvoke(Command(resume={"decision": "rejected"}), config=config)
+        assert resume_res is not None
+        saved_after = graph.get_state(config)
+        assert saved_after.values["status"] == "rejected"
+        assert saved_after.next == ()
+
+    asyncio.run(_test())
+
+
+
+

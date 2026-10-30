@@ -27,6 +27,7 @@ class Limits:
     debug_attempts: int = 3
     review_revisions: int = 2
     run_budget: int = 40
+    triage_min_confidence: float = 0.6  # placeholder, not a decision
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,8 @@ def decide(after_node: str, state: RunState, limits: Limits) -> Decision:
         tr = state.get("triage_result")
         if tr is None:
             result = Decision("escalate", StopReason.ERROR)
+        elif tr.confidence < limits.triage_min_confidence:
+            result = Decision("escalate", StopReason.TRIAGE_UNCERTAIN)
         elif tr.category == TriageCategory.OUT_OF_SCOPE:
             result = Decision("finish")
         else:

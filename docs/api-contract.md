@@ -87,7 +87,7 @@ Produced by Sanjeevni (evaluation/, observability/); served by Tamanna's metrics
 OPEN: exact response format; per-run versus aggregate views.
 
 # 7. Run status and stop reasons (for API and dashboard)
-Final outcomes: pr_opened, out_of_scope, escalated. Stop reasons for escalated: injection_suspected, plan_schema_retries_exhausted, plan_revisions_exhausted, diff_blocked, diff_schema_retries_exhausted, debugger_limit, reviewer_limit, reviewer_block, run_budget, sandbox_error, error.
+Final outcomes: pr_opened, out_of_scope, escalated. Stop reasons for escalated: injection_suspected, plan_schema_retries_exhausted, plan_revisions_exhausted, diff_blocked, diff_schema_retries_exhausted, debugger_limit, reviewer_limit, reviewer_block, run_budget, sandbox_error, error, triage_uncertain.
 
 # 8. Open items summary
 Model names per tier; retry limit values (config.py currently has one MAX_RETRY_ATTEMPTS; separate limits needed); checkpointer backend; sandbox timing and reuse; Coder tool location; Reviewer linter location; endpoint paths; metrics format; event storage; prompt caching ownership; who tests the Chainlit console.

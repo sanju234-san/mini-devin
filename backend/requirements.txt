@@ -1,4 +1,4 @@
-﻿fastapi
+fastapi
 uvicorn[standard]
 langgraph
 langchain
@@ -18,5 +18,10 @@ google-generativeai
 huggingface_hub
 
 websockets
+httpx
 pydantic
+pydantic-settings
 python-dotenv
+scikit-learn
+joblib
+

@@ -6,7 +6,6 @@ Status: draft, not yet confirmed with the project supervisor. These are designs 
 |---|---|
 | version_id | v1, v2, ... ; append-only, never edited in place |
 | author | planner or human |
-| status | draft, approved, superseded, rejected |
 | intent | what the issue wants, one or two sentences |
 | scope | what is included |
 | non_goals | what is explicitly excluded |
@@ -14,6 +13,8 @@ Status: draft, not yet confirmed with the project supervisor. These are designs 
 | requirements | list; each has id (R1, R2, ...), description, acceptance_criterion |
 | steps | ordered list; each has description, requirement_ids it serves, files it touches |
 | expected_tests | tests to add or run to show the requirements are met |
+
+Approval state is not stored on the plan. The approved plan is identified by the approved_version pointer in run state; a plan version is superseded when a newer version exists.
 
 Validation rules: at least one requirement; every step references existing requirement ids; every requirement is covered by at least one step; affected_files is not empty.
 
