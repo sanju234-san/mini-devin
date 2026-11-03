@@ -1,31 +1,43 @@
-"""Create, list, fetch, and approve/reject agent runs.
+"""Create, list, fetch agent runs, and handle human plan decisions.
 
-This module provides endpoints for tracking and interacting with agent runs:
-- GET /runs: Paginated list of recent runs.
-- GET /runs/{run_id}: Full details of a single run.
-- GET /runs/{run_id}/plan: Fetch current proposed implementation plan.
-- POST /runs/{run_id}/plan/decision: Human decision (approve, edit, reject).
-- POST /runs/{run_id}/approve: Convenience endpoint to approve the current plan.
-- POST /runs/{run_id}/reject: Convenience endpoint to reject the plan and halt safely.
+This module provides the core run lifecycle endpoints:
+- GET  /runs:                      Paginated list of recent runs (summaries, newest first).
+- GET  /runs/{run_id}:             Full details of a single run, including issue body.
+- POST /runs/{run_id}/plan/decision: Submit a human plan decision (approve / edit / reject).
+
+Plan Approval Walkthrough (beginner-friendly)
+----------------------------------------------
+1. The Planner agent finishes and the run pauses at status 'awaiting_plan_approval'.
+2. The frontend fetches the plan via the existing artifact routes (GET /runs/{id}/artifacts).
+3. The developer reads the plan and clicks Approve / Edit / Reject in the UI.
+4. The UI POSTs to /runs/{run_id}/plan/decision with a JSON body like:
+       {"decision": "approve"}
+5. This endpoint atomically claims the decision (only one request wins even if
+   two arrive simultaneously) and returns 202 with the updated RunSummary.
+6. A background task then calls the PlanResumer (Sanjeevni's agent layer) to
+   resume the paused LangGraph graph. If that call fails, the run is marked
+   failed; the 202 response is already on its way to the client.
+7. The developer can poll GET /runs/{run_id} or watch the WebSocket stream to
+   see the run progress to 'running' and eventually to 'completed'.
+
+Error codes:
+- 404: Unknown run ID.
+- 409: Run is not awaiting plan approval (wrong status or decision already made).
+- 422: Invalid request body (bad decision value, missing edited_plan, etc.).
 """
 
 from __future__ import annotations
 
-import logging
-from typing import Any, Dict
+import json
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 
-from app.agents.checkpointer import get_checkpointer
-from app.agents.graph import create_graph
-from app.api.deps import get_run_store
-from app.api.run_store import RunStore
-from app.models.plan import PlanDecisionIn
-from app.models.run import RunDetail, RunList, RunStatus
-from langgraph.types import Command
-
-logger = logging.getLogger(__name__)
+from app.api.agent_gateway import PlanResumer, resume_plan_background_task
+from app.api.deps import get_plan_resumer, get_run_store
+from app.api.run_store import PlanDecisionOutcome, RunStore
+from app.models.plan import PlanDecision, PlanDecisionIn
+from app.models.run import RunDetail, RunList, RunSummary
 
 router = APIRouter(prefix="/runs", tags=["runs"])
 
@@ -72,134 +84,84 @@ async def get_run(
     return run
 
 
-@router.get(
-    "/{run_id}/plan",
-    summary="Get proposed implementation plan for a run",
-)
-async def get_run_plan(
-    run_id: UUID,
-    store: RunStore = Depends(get_run_store),
-) -> Dict[str, Any]:
-    """Fetch the proposed implementation plan from graph state checkpoint."""
-    run = await store.get_run(run_id)
-    if run is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
-
-    graph = create_graph(checkpointer=get_checkpointer())
-    config = {"configurable": {"thread_id": str(run_id)}}
-    state = graph.get_state(config)
-
-    if not state or not state.values:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No active plan found for this run.",
-        )
-
-    plan = state.values.get("plan")
-    plan_hash = state.values.get("plan_hash")
-    plan_version = state.values.get("plan_version")
-
-    return {
-        "run_id": str(run_id),
-        "plan_version": plan_version or "v1",
-        "plan_hash": plan_hash,
-        "plan": plan.model_dump(mode="json") if hasattr(plan, "model_dump") else plan,
-    }
-
-
-async def _resume_graph_task(run_id: str, resume_payload: dict[str, Any]) -> None:
-    """Background task to resume graph execution after human decision."""
-    try:
-        graph = create_graph(checkpointer=get_checkpointer())
-        config = {"configurable": {"thread_id": run_id}}
-        logger.info("Resuming workflow for run %s with decision: %s", run_id, resume_payload.get("decision"))
-        await graph.ainvoke(Command(resume=resume_payload), config=config)
-        logger.info("Resumed workflow for run %s completed or advanced", run_id)
-    except Exception as exc:
-        logger.exception("Error resuming graph for run %s: %s", run_id, exc)
-
-
 @router.post(
     "/{run_id}/plan/decision",
-    status_code=status.HTTP_200_OK,
-    summary="Record human approval, edit, or rejection decision on proposed plan",
+    response_model=RunSummary,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Submit a human plan decision (approve / edit / reject)",
 )
-async def decide_plan(
+async def submit_plan_decision(
     run_id: UUID,
-    payload: PlanDecisionIn,
+    body: PlanDecisionIn,
     background_tasks: BackgroundTasks,
     store: RunStore = Depends(get_run_store),
-) -> Dict[str, Any]:
-    """Accept human plan decision and resume the paused LangGraph workflow."""
-    run = await store.get_run(run_id)
-    if run is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+    resumer: PlanResumer = Depends(get_plan_resumer),
+) -> RunSummary:
+    """Record the human's plan decision and schedule the agent resume.
 
-    run_id_str = str(run_id)
-    graph = create_graph(checkpointer=get_checkpointer())
-    config = {"configurable": {"thread_id": run_id_str}}
-    state = graph.get_state(config)
+    Request body fields
+    -------------------
+    decision     : "approve" | "edit" | "reject"
+    edited_plan  : dict (required only for "edit"; <= 64 KiB JSON)
+    reason       : str | None  (max 2 000 chars; stored internally, never echoed)
 
-    plan_hash = state.values.get("plan_hash", "") if state and state.values else ""
-    plan_version = state.values.get("plan_version", "v1") if state and state.values else "v1"
+    Response
+    --------
+    202 RunSummary on success. The body contains the *updated* run (new status
+    and current_step). The response never echoes back the edited_plan or reason.
 
-    decision = payload.decision
-    normalized_decision = "approved" if decision == "approve" else ("rejected" if decision == "reject" else "edit")
+    Concurrency guarantee
+    ---------------------
+    The status check and transition are one atomic operation inside the store
+    lock. Two simultaneous requests for the same run will result in one 202
+    and one 409.
+    """
+    # Serialise edited_plan to a JSON string BEFORE entering the store.
+    # The store receives a plain string (not a dict) so it can write it
+    # directly as artifact content without any agent-owned schema dependency.
+    edited_plan_content: str | None = None
+    if body.edited_plan is not None:
+        # json.dumps is safe here: PlanDecisionIn already validated the dict
+        # is JSON-serialisable and <= 64 KiB.
+        edited_plan_content = json.dumps(body.edited_plan)
 
-    resume_payload = {
-        "decision": normalized_decision,
-        "feedback": payload.reason or f"Human decision '{decision}' recorded via REST API.",
-        "plan_hash": plan_hash,
-        "plan_version": plan_version,
-    }
-    if decision == "edit" and payload.edited_plan:
-        resume_payload["edited_plan"] = payload.edited_plan
-
-    # Schedule background execution to advance the graph
-    background_tasks.add_task(_resume_graph_task, run_id_str, resume_payload)
-
-    # Update run store status
-    new_status = RunStatus.running if decision == "approve" else (RunStatus.failed if decision == "reject" else RunStatus.running)
-    await store.update_run(
-        run_id,
-        status=new_status,
-        current_step=f"resumed_{decision}",
+    # Atomically claim the decision. This is the single point of truth for
+    # whether this request wins the race; all logic (status change, artifact
+    # creation) happens inside one lock acquisition inside the store.
+    outcome, run_summary = await store.claim_plan_decision(
+        run_id=run_id,
+        decision=PlanDecision(body.decision),
+        reason=body.reason,
+        edited_plan_content=edited_plan_content,
     )
 
-    return {
-        "run_id": run_id_str,
-        "decision": decision,
-        "status": "resuming",
-        "plan_hash": plan_hash,
-        "plan_version": plan_version,
-    }
+    if outcome == PlanDecisionOutcome.NOT_FOUND:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Run not found",
+        )
+    if outcome == PlanDecisionOutcome.CONFLICT:
+        # Covers: wrong current status (queued, running, completed, failed,
+        # rejected, escalated) AND a previous decision already claimed.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Run is not awaiting plan approval",
+        )
 
+    # run_summary is guaranteed to be non-None when outcome is OK
+    assert run_summary is not None  # for type checkers
 
-@router.post(
-    "/{run_id}/approve",
-    status_code=status.HTTP_200_OK,
-    summary="Approve the proposed plan for code modification",
-)
-async def approve_plan(
-    run_id: UUID,
-    background_tasks: BackgroundTasks,
-    store: RunStore = Depends(get_run_store),
-) -> Dict[str, Any]:
-    """Convenience endpoint to approve the plan."""
-    payload = PlanDecisionIn(decision="approve", reason="Approved via REST convenience endpoint")
-    return await decide_plan(run_id, payload, background_tasks, store)
+    # Schedule the background resume call. We do this AFTER the 202 response
+    # is built so the HTTP client doesn't wait for the (potentially slow)
+    # agent layer. If the resumer raises, resume_plan_background_task catches
+    # it, marks the run failed, and never crashes the server.
+    background_tasks.add_task(
+        resume_plan_background_task,
+        run_id=run_id,
+        decision=PlanDecision(body.decision),
+        resumer=resumer,
+        store=store,
+    )
 
+    return run_summary
 
-@router.post(
-    "/{run_id}/reject",
-    status_code=status.HTTP_200_OK,
-    summary="Reject the proposed plan and halt workflow safely",
-)
-async def reject_plan(
-    run_id: UUID,
-    background_tasks: BackgroundTasks,
-    store: RunStore = Depends(get_run_store),
-) -> Dict[str, Any]:
-    """Convenience endpoint to reject the plan."""
-    payload = PlanDecisionIn(decision="reject", reason="Rejected via REST convenience endpoint")
-    return await decide_plan(run_id, payload, background_tasks, store)

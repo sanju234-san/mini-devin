@@ -1,1 +1,2 @@
-// Final artifact trail: Plan, Diff, Test Log, Screenshots/Recordings, Walkthrough, PR link.
+export { ArtifactTrailViewer } from './ArtifactTrailViewer';
+export { ArtifactTrailViewer as default } from './ArtifactTrailViewer';

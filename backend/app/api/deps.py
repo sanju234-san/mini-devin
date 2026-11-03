@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from fastapi import Request
 
-from app.api.agent_gateway import AgentGateway, MetricsProvider
+from app.api.agent_gateway import AgentGateway, MetricsProvider, PlanResumer
 from app.api.run_store import RunStore
 from app.config import Settings, get_settings
 
@@ -43,3 +43,13 @@ def get_settings_dep(request: Request) -> Settings:
     if settings is None:
         settings = get_settings()
     return settings
+
+
+def get_plan_resumer(request: Request) -> PlanResumer:
+    """Provide the PlanResumer instance stored on application state.
+
+    The default is NoOpPlanResumer (logs only). Sanjeevni's agent layer
+    replaces this with a real implementation once the LangGraph graph
+    is wired up. Tests inject a fake via app.dependency_overrides.
+    """
+    return request.app.state.plan_resumer

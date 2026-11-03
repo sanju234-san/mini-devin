@@ -1,0 +1,3 @@
+module.exports=[27572,a=>{"use strict";var b=a.i(7997);a.s(["default",0,function({children:a}){return(0,b.jsx)("html",{lang:"en",className:"dark",children:(0,b.jsx)("body",{className:"bg-surface-container-lowest text-on-surface antialiased selection:bg-primary/20",children:a})})},"metadata",0,{title:"Mini-Devin | Autonomous Issue-to-PR System",description:"Mini-Devin is an autonomous GitHub issue-to-pull-request multi-agent system.",icons:{icon:"/logo.svg"}}])},50645,function(a){a.n(a.i(27572))}];
+
+//# sourceMappingURL=src_app_layout_tsx_0r5yz5t._.js.map

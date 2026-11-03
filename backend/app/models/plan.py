@@ -86,12 +86,20 @@ class PlanDecisionIn(BaseModel):
 
     @model_validator(mode="after")
     def _validate_decision_payload(self) -> "PlanDecisionIn":
-        """Cross-field validation: edited_plan is present iff decision == 'edit'."""
+        """Cross-field validation: edited_plan is present iff decision == 'edit'.
+
+        WHY THIS CROSS-FIELD CHECK:
+        Requiring edited_plan only for 'edit' and forbidding it for 'approve'
+        and 'reject' prevents ambiguous payloads where the client sends a plan
+        object but a non-edit decision, which would silently discard the plan.
+        """
         if self.decision == "edit":
             if self.edited_plan is None:
                 raise ValueError(
                     "edited_plan is required when decision is 'edit'."
                 )
+            # Enforce 64 KiB size limit. We serialise to JSON ourselves to get
+            # a consistent byte count regardless of how the client formatted it.
             try:
                 encoded = json.dumps(self.edited_plan).encode("utf-8")
             except (TypeError, ValueError) as exc:
@@ -104,6 +112,7 @@ class PlanDecisionIn(BaseModel):
                     f"({len(encoded):,} bytes > {_MAX_EDITED_PLAN_BYTES:,})."
                 )
         else:
+            # approve or reject: edited_plan must NOT be provided
             if self.edited_plan is not None:
                 raise ValueError(
                     f"edited_plan must not be provided when decision "
@@ -113,7 +122,14 @@ class PlanDecisionIn(BaseModel):
 
 
 class PlanDecisionRecord(BaseModel):
-    """Internal-only record stored in the run store after a plan decision."""
+    """Internal-only record stored in the run store after a plan decision.
+
+    This is NEVER returned to API callers. Its sole purpose is to provide
+    an internal audit trail of what decision was made and when.
+
+    NOTE: reason is untrusted user input. It is stored as data only, never
+    executed, never included in log entries or API responses.
+    """
 
     decision: PlanDecision
     reason: str | None = None
