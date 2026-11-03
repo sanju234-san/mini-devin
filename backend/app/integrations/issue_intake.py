@@ -120,6 +120,14 @@ async def process_issue_intake(
             "html_url": issue_data.get("html_url", raw),
         }
 
+        # Resolve default branch dynamically (e.g. main, master, develop)
+        default_ref = "main"
+        try:
+            from app.integrations.github_client import GitRef, get_github_client
+            default_ref = get_github_client().fetch_repo(GitRef(owner=owner, repo=repo_name)).rsplit("@", 1)[-1]
+        except Exception:
+            pass
+
         # Snapshot resolution
         snapshot_path_str: Optional[str] = None
         commit_sha: Optional[str] = None
@@ -131,7 +139,7 @@ async def process_issue_intake(
                 snapshot_dir = await snapshot_service.create_snapshot(
                     owner=owner,
                     repo=repo_name,
-                    ref="main",
+                    ref=default_ref,
                     allow_shallow_clone_fallback=allow_shallow_clone_fallback,
                 )
                 snapshot_path_str = str(snapshot_dir)
@@ -157,7 +165,7 @@ async def process_issue_intake(
             issue_body=clean_body,
             issue_url=raw,
             issue_number=issue_number,
-            repo_ref="main",
+            repo_ref=default_ref,
             commit_sha=commit_sha,
             snapshot_path=snapshot_path_str,
             snapshot_truncated=snapshot_truncated,

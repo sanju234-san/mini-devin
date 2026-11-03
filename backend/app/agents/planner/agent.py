@@ -98,6 +98,8 @@ def try_llm_plan_generation(
             f"Generate a detailed implementation plan. Your response must be a valid JSON object "
             f"matching the ImplementationPlan schema. Ensure all file paths, steps, and root cause "
             f"findings are grounded in the provided Code Evidence.\n"
+            f"CRITICAL: Do NOT include '.github/workflows/*', '.github/actions/*', '.env*', or secret/key files "
+            f"in 'affected_files' or 'steps' unless the issue explicitly asks to modify GitHub Actions workflows.\n"
             f"Schema requirements:\n"
             f"- summary: Concise goal\n"
             f"- explanation: Detailed engineering reasoning\n"
@@ -118,6 +120,38 @@ def try_llm_plan_generation(
                     step["action"] = "create" if "add" in str(step.get("action", "")) else "modify"
             data["provenance"] = "llm_generated"
             plan = ImplementationPlan.model_validate(data)
+
+            # Strip unsolicited protected/workflow paths from LLM plan unless issue explicitly targets workflows
+            from app.guardrails.output_guardrails import validate_path_safety
+
+            issue_text_lower = f"{title} {body}".lower()
+            explicitly_requests_workflow = any(
+                kw in issue_text_lower
+                for kw in (".github/workflows", ".github/actions", "github action", "workflow file", "ci.yml", "ci.yaml")
+            )
+            allowed_wf_for_plan = (
+                [p for p in plan.affected_files if p.strip().replace("\\", "/").startswith(".github/workflows/")]
+                if explicitly_requests_workflow
+                else []
+            )
+            safe_affected = [
+                f for f in plan.affected_files
+                if validate_path_safety(f, allowed_workflow_paths=allowed_wf_for_plan)[0]
+            ]
+            if safe_affected and len(safe_affected) != len(plan.affected_files):
+                plan.affected_files = safe_affected
+                filtered_steps: list[PlanStep] = []
+                for step in plan.steps:
+                    tf = (step.target_file or "").strip()
+                    if tf and tf not in ("repository_root", "tests/", "repo_checkout") and not validate_path_safety(
+                        tf, allowed_workflow_paths=allowed_wf_for_plan
+                    )[0]:
+                        continue
+                    filtered_steps.append(step)
+                if filtered_steps:
+                    for idx, st in enumerate(filtered_steps, start=1):
+                        st.step_number = idx
+                    plan.steps = filtered_steps
 
             # Validate LLM-proposed file paths against retrieved evidence.
             retrieved_files: set[str] = set(retrieved.get("files", []))

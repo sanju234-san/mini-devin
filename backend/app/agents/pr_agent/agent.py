@@ -8,6 +8,7 @@ Safety Rule: Strictly opens pull requests; NEVER attempts to merge pull requests
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from app.agents.model_router import route
@@ -136,6 +137,8 @@ def pr_node(state: AgentState) -> dict[str, Any]:
         github_client_ready = True
 
         owner, repo_name = repo.split("/", 1) if "/" in repo else ("mini-devin", repo)
+        try: base_branch = state.get("repo_ref") or client.fetch_repo(GitRef(owner=owner, repo=repo_name)).rsplit("@", 1)[-1]
+        except Exception: base_branch = state.get("repo_ref") or "main"
         git_ref = GitRef(owner=owner, repo=repo_name, branch=base_branch)
 
         # 1. Determine target branch and repository (direct or via user fork)
@@ -162,11 +165,18 @@ def pr_node(state: AgentState) -> dict[str, Any]:
 
         # 2. Push code changes to branch (either on target repo or fork)
         files_to_push = []
+        workspace_path = state.get("workspace_path") or state.get("snapshot_path")
         for ch in (code_changes if isinstance(code_changes, list) else [code_changes]):
             fpath = ch.get("path") or ch.get("file_path", "") if isinstance(ch, dict) else (getattr(ch, "path", None) or getattr(ch, "file_path", ""))
-            content = ch.get("content") or ch.get("new_content") or ch.get("diff") if isinstance(ch, dict) else (getattr(ch, "content", None) or getattr(ch, "diff", ""))
+            content = ch.get("content") or ch.get("new_content") if isinstance(ch, dict) else (getattr(ch, "content", None) or getattr(ch, "new_content", None))
             if fpath:
-                files_to_push.append(FileChange(path=fpath, content=content or "# mini-devin update\n", action="modify"))
+                if not content and workspace_path:
+                    target_file = Path(workspace_path) / fpath
+                    if target_file.is_file():
+                        content = target_file.read_text(encoding="utf-8")
+                if not content:
+                    raise ValueError(f"PR Agent blocked: file '{fpath}' has empty or missing content. Refusing to push unverified or placeholder changes.")
+                files_to_push.append(FileChange(path=fpath, content=content, action="modify"))
 
         if files_to_push:
             try:
@@ -188,6 +198,8 @@ def pr_node(state: AgentState) -> dict[str, Any]:
         if pr_resp and pr_resp.pr_url:
             pr_url = pr_resp.pr_url
             logger.info("PR Agent successfully obtained PR URL: %s", pr_url)
+    except ValueError:
+        raise
     except Exception as exc:
         logger.warning("GitHub client submission failed or skipped: %s", exc)
 

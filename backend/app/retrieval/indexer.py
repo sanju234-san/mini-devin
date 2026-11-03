@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 # Standard directory exclusions
 EXCLUDED_DIRS = frozenset({
     ".git",
+    ".github",
     ".hg",
     ".svn",
     ".venv",

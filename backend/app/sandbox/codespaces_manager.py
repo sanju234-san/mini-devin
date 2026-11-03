@@ -60,6 +60,194 @@ def _resolve_gh_bin() -> str:
     return "gh"
 
 
+def _clean_header_token(raw: str) -> Optional[str]:
+    """Extract path token from a diff header line, stripping timestamps and quotes."""
+    token = raw.split("\t", 1)[0].strip()
+    if len(token) >= 2 and token.startswith('"') and token.endswith('"'):
+        token = token[1:-1]
+    if token in ("/dev/null", "dev/null"):
+        return None
+    return token
+
+
+def _validate_patch_target_path(raw_path: str, workspace: Optional[Path] = None) -> str:
+    """
+    Validate a single diff header path against traversal, absolute/drive/UNC paths,
+    protected-file rules, and symlink escapes outside the sandbox workspace.
+    """
+    if not raw_path or not raw_path.strip() or any(c in raw_path for c in ("\x00", "\r", "\n")):
+        raise InvalidRequestError("Diff contains empty or malformed target file path.")
+
+    cleaned = raw_path.strip()
+    if len(cleaned) >= 2 and cleaned[:2] in ("a/", "b/", "a\\", "b\\"):
+        cleaned = cleaned[2:]
+
+    if not cleaned:
+        raise InvalidRequestError(f"Diff contains empty target file path in header '{raw_path}'.")
+
+    # Reject Unix absolute paths, Windows root/UNC paths, and Windows drive-letter paths
+    if (
+        cleaned.startswith("\\\\")
+        or cleaned.startswith("//")
+        or cleaned.startswith("\\")
+        or cleaned.startswith("/")
+        or re.match(r"^/?[A-Za-z]:", cleaned)
+    ):
+        raise InvalidRequestError(
+            f"Diff contains forbidden absolute, Windows drive, or UNC path: '{raw_path}'."
+        )
+
+    norm = cleaned.replace("\\", "/")
+    parts = norm.split("/")
+    if any(part in ("..", ".", "") for part in parts):
+        raise InvalidRequestError(
+            f"Diff contains path traversal or invalid segment in target path: '{raw_path}'."
+        )
+
+    from app.guardrails.output_guardrails import validate_path_safety
+
+    is_safe, reason = validate_path_safety(norm)
+    if not is_safe:
+        raise InvalidRequestError(f"Diff target path rejected by security policy: {reason}")
+
+    if norm.lower() in ("etc/passwd", "etc/shadow", "windows/system32"):
+        raise InvalidRequestError(f"Diff touches forbidden system path: '{norm}'.")
+
+    if workspace is not None:
+        ws_root = workspace.resolve()
+        if ws_root.is_symlink() or os.path.islink(workspace):
+            raise InvalidRequestError("Sandbox workspace root cannot be a symbolic link.")
+
+        current = ws_root
+        for part in parts:
+            current = current / part
+            if current.is_symlink() or os.path.islink(current):
+                raise InvalidRequestError(
+                    f"Diff target path '{norm}' traverses symbolic link '{current.name}'."
+                )
+            if current.exists():
+                try:
+                    current.resolve().relative_to(ws_root)
+                except ValueError as exc:
+                    raise InvalidRequestError(
+                        f"Diff target path '{norm}' escapes workspace via '{current.name}'."
+                    ) from exc
+
+        resolved_target = (ws_root / norm).resolve()
+        try:
+            resolved_target.relative_to(ws_root)
+        except ValueError as exc:
+            raise InvalidRequestError(
+                f"Diff target path '{norm}' resolves outside sandbox workspace."
+            ) from exc
+
+        if resolved_target == ws_root:
+            raise InvalidRequestError(f"Diff target path '{norm}' resolves to workspace root.")
+
+    return norm
+
+
+def _extract_and_validate_diff_paths(
+    diff_text: str,
+    workspace: Optional[Path] = None,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """
+    Parse and validate all file paths referenced in unified/git diff headers before applying.
+    Returns (applied_files, per_file_added_lines).
+    """
+    if re.search(
+        r"^(?:new file mode|old mode|new mode|deleted file mode)\s+120000\b"
+        r"|^index\s+[0-9a-f]+\.\.[0-9a-f]+\s+120000\b",
+        diff_text,
+        re.MULTILINE,
+    ):
+        raise InvalidRequestError("Diff contains forbidden symlink mode (120000).")
+
+    lines = diff_text.splitlines()
+    all_validated_paths: list[str] = []
+    applied_files: list[str] = []
+    file_additions: dict[str, list[str]] = {}
+    current_target: Optional[str] = None
+    in_hunk = False
+
+    for idx, line in enumerate(lines):
+        if line.startswith("diff --git "):
+            in_hunk = False
+            current_target = None
+            rest = line[len("diff --git "):].strip()
+            git_tokens = re.findall(r'"[^"]+"|\S+', rest)
+            if len(git_tokens) >= 2:
+                for tok in git_tokens[:2]:
+                    cleaned_tok = _clean_header_token(tok)
+                    if cleaned_tok is not None:
+                        vpath = _validate_patch_target_path(cleaned_tok, workspace)
+                        all_validated_paths.append(vpath)
+            continue
+
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+
+        if not in_hunk and line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
+            for prefix in ("rename from ", "rename to ", "copy from ", "copy to "):
+                if line.startswith(prefix):
+                    tok = _clean_header_token(line[len(prefix):])
+                    if tok is not None:
+                        vpath = _validate_patch_target_path(tok, workspace)
+                        all_validated_paths.append(vpath)
+                        if prefix in ("rename to ", "copy to ") and vpath not in applied_files:
+                            applied_files.append(vpath)
+                            current_target = vpath
+                    break
+            continue
+
+        if line.startswith("--- "):
+            next_is_plus_header = (idx + 1 < len(lines)) and lines[idx + 1].startswith("+++ ")
+            raw_arg = line[4:].lstrip()
+            looks_like_path_header = (
+                not in_hunk
+                or next_is_plus_header
+                or raw_arg.startswith(("a/", "a\\", "/", "\\", '"a/', '"/', ".."))
+                or bool(re.match(r'^"?[A-Za-z]:', raw_arg))
+            )
+            if looks_like_path_header:
+                in_hunk = False
+                tok = _clean_header_token(line[4:])
+                if tok is not None:
+                    vpath = _validate_patch_target_path(tok, workspace)
+                    all_validated_paths.append(vpath)
+                continue
+
+        if line.startswith("+++ "):
+            raw_arg = line[4:].lstrip()
+            looks_like_path_header = (
+                not in_hunk
+                or raw_arg.startswith(("b/", "b\\", "/", "\\", '"b/', '"/', ".."))
+                or bool(re.match(r'^"?[A-Za-z]:', raw_arg))
+            )
+            if looks_like_path_header:
+                in_hunk = False
+                tok = _clean_header_token(line[4:])
+                if tok is not None:
+                    vpath = _validate_patch_target_path(tok, workspace)
+                    all_validated_paths.append(vpath)
+                    if vpath not in applied_files:
+                        applied_files.append(vpath)
+                    file_additions.setdefault(vpath, [])
+                    current_target = vpath
+                else:
+                    current_target = None
+                continue
+
+        if line.startswith("+") and not line.startswith("+++") and current_target is not None:
+            file_additions.setdefault(current_target, []).append(line[1:])
+
+    if not all_validated_paths:
+        raise InvalidRequestError("Diff contains no valid file headers.")
+
+    return applied_files, file_additions
+
+
 class CodespacesSandboxManager(SandboxManager):
     """
     Adapter managing ephemeral sandboxes via GitHub Codespaces or isolated scratch workspaces.
@@ -118,7 +306,7 @@ class CodespacesSandboxManager(SandboxManager):
         if self.use_cloud_codespaces and self._token:
             try:
                 owner_repo = repo_ref.split("@")[0]
-                branch = repo_ref.split("@")[1] if "@" in repo_ref else "main"
+                branch = repo_ref.split("@")[1] if "@" in repo_ref else None
                 owner, repo = owner_repo.split("/", 1)
                 
                 url = f"{self.api_base_url}/repos/{owner}/{repo}/codespaces"
@@ -126,9 +314,15 @@ class CodespacesSandboxManager(SandboxManager):
                     "Authorization": f"Bearer {self._token}",
                     "Accept": "application/vnd.github.v3+json",
                 }
-                payload = {"ref": branch, "idle_timeout_minutes": 10}
 
                 with httpx.Client(timeout=45.0) as client:
+                    if not branch:
+                        try:
+                            r_info = client.get(f"{self.api_base_url}/repos/{owner}/{repo}", headers=headers)
+                            branch = r_info.json().get("default_branch", "main") if r_info.status_code == 200 else "main"
+                        except Exception:
+                            branch = "main"
+                    payload = {"ref": branch, "idle_timeout_minutes": 10}
                     resp = client.post(url, json=payload, headers=headers)
                     if resp.status_code not in (200, 201, 202):
                         raise SandboxUnavailableError(f"GitHub Codespaces API creation failed: {resp.text}")
@@ -199,14 +393,15 @@ class CodespacesSandboxManager(SandboxManager):
         if not diff_text or not diff_text.strip():
             return DiffApplyResponse(success=True, applied_files=[])
 
-        # Security check on diff text
-        if ".." in diff_text or "/etc/passwd" in diff_text:
-            raise InvalidRequestError("Diff contains path traversal or forbidden paths.")
-
-        applied_files = []
-        for line in diff_text.splitlines():
-            if line.startswith("+++ b/"):
-                applied_files.append(line[6:].strip())
+        workspace_for_validation = (
+            Path(info["workspace_path"])
+            if info.get("type") == "isolated_local" and info.get("workspace_path")
+            else None
+        )
+        applied_files, file_additions = _extract_and_validate_diff_paths(
+            diff_text,
+            workspace=workspace_for_validation,
+        )
 
         if info["type"] == "cloud":
             cs_name = re.sub(r"[^a-zA-Z0-9_-]", "", str(info["codespace_name"]))
@@ -214,16 +409,43 @@ class CodespacesSandboxManager(SandboxManager):
             raw_repo_name = repo_ref.split("/")[-1].split("@")[0] if repo_ref else ""
             repo_name = re.sub(r"[^A-Za-z0-9._-]", "", raw_repo_name)
             cd_prefix = f"cd /workspaces/{repo_name} && " if repo_name else ""
-            cmd = [_resolve_gh_bin(), "cs", "ssh", "-c", cs_name, "--", f"{cd_prefix}git apply --ignore-whitespace -"]
+            normalized_diff = diff_text.replace("\r\n", "\n")
+            if not normalized_diff.endswith("\n"):
+                normalized_diff += "\n"
+            cmd = [_resolve_gh_bin(), "cs", "ssh", "-c", cs_name, "--", f"{cd_prefix}git apply --recount --ignore-whitespace --whitespace=nowarn -"]
             try:
                 proc = subprocess.run(
                     cmd,
-                    input=diff_text,
+                    input=normalized_diff,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=30,
                 )
                 if proc.returncode != 0:
+                    # Fallback: write validated file_additions directly in the cloud codespace (matching local sandbox fallback)
+                    if applied_files:
+                        fallback_ok = True
+                        for fpath in applied_files:
+                            content_str = "\n".join(file_additions.get(fpath, [])) + "\n"
+                            q_path = shlex.quote(fpath)
+                            fb_cmd = [_resolve_gh_bin(), "cs", "ssh", "-c", cs_name, "--", f"{cd_prefix}mkdir -p $(dirname {q_path}) && cat > {q_path}"]
+                            fb_proc = subprocess.run(
+                                fb_cmd,
+                                input=content_str,
+                                capture_output=True,
+                                text=True,
+                                encoding="utf-8",
+                                errors="replace",
+                                timeout=30,
+                            )
+                            if fb_proc.returncode != 0:
+                                fallback_ok = False
+                                break
+                        if fallback_ok:
+                            logger.info("Applied diff via direct file write fallback to cloud codespace '%s': %s", cs_name, applied_files)
+                            return DiffApplyResponse(success=True, applied_files=applied_files)
                     err_msg = proc.stderr.strip() or proc.stdout.strip() or f"git apply failed with code {proc.returncode}"
                     logger.error("Cloud codespace diff apply failed on '%s': %s", cs_name, err_msg)
                     return DiffApplyResponse(success=False, error=err_msg, applied_files=[])
@@ -234,34 +456,39 @@ class CodespacesSandboxManager(SandboxManager):
                 return DiffApplyResponse(success=False, error=str(exc), applied_files=[])
 
         # Isolated local sandbox application
-        workspace = Path(info["workspace_path"])
+        workspace = Path(info["workspace_path"]).resolve()
         patch_file = workspace / "change.patch"
         try:
             patch_file.write_text(diff_text, encoding="utf-8")
             # Try git apply or simple file modification simulation
             res = subprocess.run(
-                ["git", "apply", "--ignore-whitespace", str(patch_file)],
+                ["git", "apply", "--recount", "--ignore-whitespace", str(patch_file)],
                 cwd=str(workspace),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=15,
             )
             if res.returncode != 0:
                 # If git apply fails (e.g. not a git repo), write files directly for deterministic changes
                 for fpath in applied_files:
-                    target = workspace / fpath
+                    target = (workspace / fpath).resolve()
+                    target.relative_to(workspace)
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    # Extract addition lines
-                    content_lines = []
-                    for line in diff_text.splitlines():
-                        if line.startswith("+") and not line.startswith("+++"):
-                            content_lines.append(line[1:])
+                    content_lines = file_additions.get(fpath, [])
                     target.write_text("\n".join(content_lines) + "\n", encoding="utf-8")
 
             return DiffApplyResponse(success=True, applied_files=applied_files)
         except Exception as exc:
             logger.exception("Failed to apply diff to sandbox %s", req.sandbox_id)
             return DiffApplyResponse(success=False, error=str(exc))
+        finally:
+            if patch_file.exists():
+                try:
+                    patch_file.unlink()
+                except Exception:
+                    pass
 
     def run_tests(self, req: TestRunRequest) -> TestRunResponse:
         """Execute test commands inside the sandbox using argument vectors."""
@@ -296,6 +523,8 @@ class CodespacesSandboxManager(SandboxManager):
                     cmd,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=req.timeout_seconds,
                 )
                 duration_ms = int((time.perf_counter() - start_time) * 1000)
@@ -352,6 +581,8 @@ class CodespacesSandboxManager(SandboxManager):
                 cwd=workspace,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=req.timeout_seconds,
             )
             duration_ms = int((time.perf_counter() - start_time) * 1000)

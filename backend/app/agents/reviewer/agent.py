@@ -12,7 +12,7 @@ from typing import Any
 
 from app.agents.model_router import route
 from app.agents.schemas import AgentState, ReviewFindings, create_event
-from app.guardrails.output_guardrails import validate_diff_safety, validate_path_safety
+from app.guardrails.output_guardrails import get_human_approved_workflow_paths, validate_diff_safety, validate_path_safety
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +106,8 @@ def reviewer_node(state: AgentState) -> dict[str, Any]:
             revision_instructions.append("Fix syntax errors detected by static analysis.")
 
         # 2. Security dimension
-        clean_diff, violations = validate_diff_safety(changes_list)
+        allowed_workflows = get_human_approved_workflow_paths(state.get("human_approval"), plan)
+        clean_diff, violations = validate_diff_safety(changes_list, allowed_workflow_paths=allowed_workflows)
         if not clean_diff:
             comments.append(f"Security violation: diff modifies prohibited files: {', '.join(violations)}")
             is_blocked = True

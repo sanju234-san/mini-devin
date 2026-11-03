@@ -108,54 +108,181 @@ def validate_triage_output(
 
 # ── Dangerous Path & Diff Safety Guardrails ──────────────────────────
 
+_WORKFLOW_DENY_PATTERN = r"^\.github/(?:workflows|actions)/.*"
+_CANONICAL_WORKFLOW_RE = re.compile(r"^\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml$", re.IGNORECASE)
+
 DENIED_PATH_PATTERNS = (
-    r"^\.env.*",
+    r"(?:^|/)\.env(?:\..+)?$",
     r".*\.pem$",
     r".*\.key$",
     r".*\.pfx$",
     r".*\.pkcs12$",
-    r".*id_rsa.*",
-    r".*id_ed25519.*",
-    r"^\.git/.*",
-    r"^\.github/.*",
-    r".*secret.*",
-    r".*credential.*",
-    r".*token.*",
+    r"(?:^|/)id_rsa.*",
+    r"(?:^|/)id_ed25519.*",
+    r"^\.git(?:/.*|$)",
+    _WORKFLOW_DENY_PATTERN,
+    r"(?:^|/)\.?secrets?(?:\.(?:json|ya?ml|toml|ini|cfg|conf|txt|env))?$",
+    r".*\.secret$",
+    r"(?:^|/)\.?credentials?(?:\.(?:json|ya?ml|toml|ini|cfg|conf|txt|env))?$",
+    r"(?:^|/)service-account.*\.json$",
+    r"(?:^|/)\.?tokens?(?:\.(?:json|ya?ml|toml|ini|cfg|conf|txt|env))?$",
+    r".*\.token$",
 )
 _DENIED_REGEXES = [re.compile(p, re.IGNORECASE) for p in DENIED_PATH_PATTERNS]
 
+_DANGEROUS_WORKFLOW_CONTENT_RES = (
+    re.compile(r"^\+.*\bpull_request_target\b", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\+.*\bpermissions\s*:\s*write-all\b", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\+.*(?:curl|wget|nc|netcat)\b.*\$\{\{\s*secrets\.", re.IGNORECASE | re.MULTILINE),
+)
 
-def validate_path_safety(file_path: str) -> tuple[bool, str]:
+
+def validate_workflow_diff_content(diff_text: str) -> tuple[bool, str]:
+    """
+    Validate that an explicitly human-approved workflow diff does not introduce
+    privilege escalation (pull_request_target, write-all) or secret exfiltration.
+    """
+    if not diff_text:
+        return True, ""
+    for rx in _DANGEROUS_WORKFLOW_CONTENT_RES:
+        if rx.search(diff_text):
+            return (
+                False,
+                f"Workflow diff rejected: contains forbidden pattern '{rx.pattern}'.",
+            )
+    return True, ""
+
+
+def get_human_approved_workflow_paths(
+    human_approval: Any,
+    approved_plan: Any,
+) -> set[str]:
+    """
+    Derive the exact set of GitHub Actions workflow paths explicitly authorized
+    by a human operator for a hash-verified frozen plan.
+
+    Security Invariants:
+    - Never trusts LLM or Coder output to self-authorize workflow changes.
+    - Requires human_approval['decision'] == 'approved' AND
+      human_approval['allow_workflow_changes'] is True.
+    - Requires cryptographic plan hash match between approved_plan and human_approval['plan_hash'].
+    - Only permits canonical '.github/workflows/<file>.yml|.yaml' paths listed in
+      approved_plan['affected_files'] (and human_approval['allowed_workflow_paths'] if provided).
+    """
+    if not isinstance(human_approval, dict):
+        return set()
+    if human_approval.get("decision") != "approved":
+        return set()
+    if human_approval.get("allow_workflow_changes") is not True:
+        return set()
+    if not approved_plan:
+        return set()
+
+    plan_dict = (
+        approved_plan.model_dump(mode="json")
+        if hasattr(approved_plan, "model_dump")
+        else (dict(approved_plan) if isinstance(approved_plan, dict) else None)
+    )
+    if not isinstance(plan_dict, dict):
+        return set()
+
+    approved_hash = human_approval.get("plan_hash")
+    if not approved_hash or not isinstance(approved_hash, str):
+        return set()
+
+    from app.agents.schemas import compute_plan_hash  # noqa: PLC0415
+
+    if compute_plan_hash(plan_dict) != approved_hash:
+        return set()
+
+    affected = plan_dict.get("affected_files") or []
+    if not isinstance(affected, list):
+        return set()
+
+    candidates: set[str] = set()
+    for path in affected:
+        if not isinstance(path, str):
+            continue
+        norm = path.strip().replace("\\", "/")
+        if ".." not in norm.split("/") and _CANONICAL_WORKFLOW_RE.match(norm):
+            candidates.add(norm)
+
+    explicit_list = human_approval.get("allowed_workflow_paths")
+    if explicit_list is not None:
+        if not isinstance(explicit_list, (list, tuple, set)):
+            return set()
+        explicit_norm = {
+            p.strip().replace("\\", "/")
+            for p in explicit_list
+            if isinstance(p, str)
+        }
+        candidates &= explicit_norm
+
+    return candidates
+
+
+def validate_path_safety(
+    file_path: str,
+    allowed_workflow_paths: Sequence[str] | set[str] | None = None,
+) -> tuple[bool, str]:
     """
     Check if a file path is safe from path traversal and sensitive denylists.
-    
+
+    By default, all '.github/workflows/*' and '.github/actions/*' paths are strictly denied.
+    A workflow path is permitted only if it is present in 'allowed_workflow_paths'
+    (verified from explicit human approval and frozen plan hash) and matches
+    canonical '.github/workflows/<name>.yml|.yaml'.
+
     Returns (is_safe, violation_reason).
     """
     if not file_path or not file_path.strip():
         return False, "File path is empty."
 
-    norm = file_path.strip().replace("\\", "/")
+    if any(c in file_path for c in ("\x00", "\r", "\n")):
+        return False, "File path contains forbidden control characters."
+
+    raw_stripped = file_path.strip()
+    norm = raw_stripped.replace("\\", "/")
 
     # Check directory traversal
     if ".." in norm.split("/"):
         return False, f"Path traversal ('..') detected in '{file_path}'."
 
-    # Check absolute path escapes
-    if norm.startswith("/") or re.match(r"^[A-Za-z]:", norm):
+    # Check absolute, UNC, or Windows drive path escapes
+    if (
+        raw_stripped.startswith("\\\\")
+        or norm.startswith("/")
+        or re.match(r"^/?[A-Za-z]:", norm)
+    ):
         return False, f"Absolute path '{file_path}' is forbidden; paths must be repository-relative."
+
+    allowed_wf_set = {
+        p.strip().replace("\\", "/")
+        for p in (allowed_workflow_paths or ())
+        if isinstance(p, str)
+    }
 
     # Check sensitive denylist
     for rx in _DENIED_REGEXES:
         if rx.search(norm):
+            if (
+                rx.pattern == _WORKFLOW_DENY_PATTERN
+                and norm in allowed_wf_set
+                and _CANONICAL_WORKFLOW_RE.match(norm)
+            ):
+                continue
             return False, f"Access to sensitive file pattern '{rx.pattern}' in '{file_path}' is denied."
 
     return True, ""
 
 
-def validate_diff_safety(file_changes: Sequence[dict[str, Any] | Any]) -> tuple[bool, list[str]]:
+def validate_diff_safety(
+    file_changes: Sequence[dict[str, Any] | Any],
+    allowed_workflow_paths: Sequence[str] | set[str] | None = None,
+) -> tuple[bool, list[str]]:
     """
     Validate proposed file changes against sensitive file denylists.
-    
+
     Returns (is_clean, violations).
     """
     violations: list[str] = []
@@ -166,10 +293,23 @@ def validate_diff_safety(file_changes: Sequence[dict[str, Any] | Any]) -> tuple[
         path = change.get("path") if isinstance(change, dict) else getattr(change, "path", "")
         if not path:
             path = change.get("file_path") if isinstance(change, dict) else getattr(change, "file_path", "")
-        is_safe, reason = validate_path_safety(path)
+        is_safe, reason = validate_path_safety(path, allowed_workflow_paths=allowed_workflow_paths)
         if not is_safe:
             violations.append(reason)
             logger.warning("Diff gate guardrail triggered: %s", reason)
+            continue
+
+        norm_path = str(path).strip().replace("\\", "/")
+        if _CANONICAL_WORKFLOW_RE.match(norm_path):
+            diff_text = (
+                (change.get("diff_text") or change.get("diff") or "")
+                if isinstance(change, dict)
+                else (getattr(change, "diff_text", None) or getattr(change, "diff", "") or "")
+            )
+            wf_ok, wf_reason = validate_workflow_diff_content(str(diff_text))
+            if not wf_ok:
+                violations.append(wf_reason)
+                logger.warning("Workflow diff content guardrail triggered: %s", wf_reason)
 
     return len(violations) == 0, violations
 

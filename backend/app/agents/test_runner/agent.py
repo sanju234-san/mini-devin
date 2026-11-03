@@ -14,6 +14,7 @@ Browser test results are stored under `browser_test_results` in the state.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from app.agents.schemas import AgentState, TestResults, create_event
@@ -36,7 +37,12 @@ def test_runner_node(state: AgentState) -> dict[str, Any]:
 
     # ── Sandbox execution ────────────────────────────────────────────────────
     existing_results = state.get("test_results")
-    if existing_results is not None:
+    _existing_passed = bool(
+        existing_results.get("passed", False)
+        if isinstance(existing_results, dict)
+        else getattr(existing_results, "passed", False)
+    ) if existing_results is not None else False
+    if existing_results is not None and _existing_passed:
         sandbox_ready = True
         test_run_success = bool(
             existing_results.get("passed", False)
@@ -72,29 +78,32 @@ def test_runner_node(state: AgentState) -> dict[str, Any]:
             sb_resp = sb.create_sandbox(SandboxCreateRequest(repo_ref=repo, timeout_seconds=120))
             sandbox_id = sb_resp.sandbox_id
 
-            # Apply code changes if diff exists
+            # Apply all code changes if diffs exist
             code_changes = state.get("code_changes") or []
-            diff_text = ""
-            if isinstance(code_changes, list) and code_changes:
-                first_c = code_changes[0]
-                diff_text = first_c.get("diff_text") if isinstance(first_c, dict) else getattr(first_c, "diff_text", "")
-            elif isinstance(code_changes, dict):
-                diff_text = code_changes.get("diff_text", "")
+            apply_failed = False
+            apply_errors: list[str] = []
+            for c in (code_changes if isinstance(code_changes, list) else [code_changes]):
+                d_text = c.get("diff_text") if isinstance(c, dict) else getattr(c, "diff_text", "")
+                if d_text:
+                    apply_resp = sb.apply_diff(DiffApplyRequest(sandbox_id=sandbox_id, diff_text=d_text))
+                    if not apply_resp.success:
+                        logger.warning("Sandbox diff apply warning: %s", apply_resp.error)
+                        apply_failed = True
+                        if apply_resp.error:
+                            apply_errors.append(apply_resp.error)
 
-            if diff_text:
-                apply_resp = sb.apply_diff(DiffApplyRequest(sandbox_id=sandbox_id, diff_text=diff_text))
-                if not apply_resp.success:
-                    logger.warning("Sandbox diff apply warning: %s", apply_resp.error)
+            workspace_path = state.get("workspace_path") or state.get("snapshot_path")
+            test_cmd = ["python", "-m", "pytest", "-q"] if (workspace_path and (Path(workspace_path) / "tests").is_dir()) else ["python", "-c", "print('Mini-Devin verification tests passed in sandbox.')"]
 
             # Run verification command
             run_resp = sb.run_tests(TestRunRequest(
                 sandbox_id=sandbox_id,
-                argv=["python", "-c", "print('Mini-Devin verification tests passed in sandbox.')"],
+                argv=test_cmd,
                 timeout_seconds=30,
             ))
 
-            test_run_success = (run_resp.exit_code == 0)
-            details = run_resp.stdout if test_run_success else (run_resp.stderr or "Tests failed in sandbox")
+            test_run_success = (run_resp.exit_code == 0) and not apply_failed
+            details = run_resp.stdout if test_run_success else (run_resp.stderr or ("; ".join(apply_errors) if apply_errors else "Tests failed in sandbox"))
 
         except (HostExecutionBlockedError, SandboxUnavailableError) as exc:
             logger.warning("Sandbox unavailable or host execution blocked: %s", exc)

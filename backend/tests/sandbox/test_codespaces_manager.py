@@ -1,3 +1,4 @@
+from pathlib import Path
 """
 Tests for Sandbox Abstraction, GitHub Codespaces Adapter, and Host Execution Guard.
 """
@@ -202,3 +203,179 @@ def test_route_test_runner_escalates_on_sandbox_unavailable():
     terminal_output = test_unverified_terminal_node(state)
     assert terminal_output["status"] == "escalated"
     assert "Sandbox unavailable" in terminal_output["error"]
+# ── Regression Tests: Legitimate Next.js/TS Syntax vs. Malicious Target Paths ──
+
+def test_apply_diff_accepts_nextjs_catchall_spread_and_relative_imports(default_manager):
+    """
+    Legitimate TypeScript/Next.js diffs containing spread syntax (...err.rowData),
+    relative imports (../schema/patientImportSchema), and catch-all route filenames
+    (app/import/[...slug].tsx, app/api/import/[...].ts) must be accepted.
+    """
+    sb = default_manager.create_sandbox(SandboxCreateRequest(repo_ref="PUDUCAN-JIPMER/puducan-jipmer"))
+    workspace = Path(default_manager._sandboxes[sb.sandbox_id]["workspace_path"])
+    try:
+        valid_ts_diff = (
+            "--- a/lib/import/importUtils.ts\n"
+            "+++ b/lib/import/importUtils.ts\n"
+            "@@ -1,4 +1,12 @@\n"
+            "+import { patientImportSchema } from '../schema/patientImportSchema'\n"
+            "+export function formatErrors(errors: any[]) {\n"
+            "+  return errors.map((err) => ({\n"
+            "+    Row: err.row,\n"
+            "+    ...err.rowData,\n"
+            "+  }))\n"
+            "+}\n"
+            "--- /dev/null\n"
+            "+++ b/app/import/[...slug].tsx\n"
+            "@@ -0,0 +1,4 @@\n"
+            "+export default function CatchAllImportPage() {\n"
+            "+  return <div>Loading...</div>\n"
+            "+}\n"
+            "--- /dev/null\n"
+            "+++ b/app/api/import/[...].ts\n"
+            "@@ -0,0 +1,3 @@\n"
+            "+export async function POST(req: Request) {\n"
+            "+  return new Response('ok')\n"
+            "+}\n"
+        )
+        resp = default_manager.apply_diff(DiffApplyRequest(sandbox_id=sb.sandbox_id, diff_text=valid_ts_diff))
+        assert resp.success is True
+        assert resp.applied_files == [
+            "lib/import/importUtils.ts",
+            "app/import/[...slug].tsx",
+            "app/api/import/[...].ts",
+        ]
+        assert "...err.rowData" in (workspace / "lib/import/importUtils.ts").read_text(encoding="utf-8")
+        assert "../schema/patientImportSchema" in (workspace / "lib/import/importUtils.ts").read_text(encoding="utf-8")
+        assert (workspace / "app/import/[...slug].tsx").is_file()
+        assert (workspace / "app/api/import/[...].ts").is_file()
+    finally:
+        default_manager.destroy_sandbox(sb.sandbox_id)
+
+
+@pytest.mark.parametrize(
+    "malicious_header_path",
+    [
+        "b/../../etc/passwd",
+        "b/src/../../outside.py",
+        "b/src\\..\\outside.py",
+        "/etc/passwd",
+        "b//etc/passwd",
+        "C:\\Windows\\System32\\drivers\\etc\\hosts",
+        "b/C:/Windows/win.ini",
+        "D:evil.py",
+        "\\\\evil-server\\share\\payload.py",
+        "b/\\\\evil-server\\share\\payload.py",
+        "//evil-server/share/payload.py",
+        "b/.env",
+        "b/.env.production",
+        "b/.github/workflows/ci.yml",
+        "b/.git/config",
+        "b/certs/private.key",
+    ],
+)
+def test_apply_diff_rejects_malicious_target_paths(default_manager, malicious_header_path):
+    """
+    Reject path traversal, Unix absolute paths, Windows drive/UNC paths,
+    and protected denylisted files in diff headers.
+    """
+    sb = default_manager.create_sandbox(SandboxCreateRequest(repo_ref="pallets/flask"))
+    try:
+        bad_diff = (
+            f"--- a/src/app.py\n"
+            f"+++ {malicious_header_path}\n"
+            f"@@ -1,1 +1,2 @@\n"
+            f"+malicious_payload = True\n"
+        )
+        with pytest.raises(InvalidRequestError):
+            default_manager.apply_diff(DiffApplyRequest(sandbox_id=sb.sandbox_id, diff_text=bad_diff))
+
+        # Also test malicious source path in '---' header (e.g. file deletion)
+        bad_source_diff = (
+            f"--- {malicious_header_path}\n"
+            f"+++ /dev/null\n"
+            f"@@ -1,1 +0,0 @@\n"
+            f"-deleted\n"
+        )
+        with pytest.raises(InvalidRequestError):
+            default_manager.apply_diff(DiffApplyRequest(sandbox_id=sb.sandbox_id, diff_text=bad_source_diff))
+    finally:
+        default_manager.destroy_sandbox(sb.sandbox_id)
+
+
+def test_apply_diff_rejects_symlink_mode_and_symlink_escapes(default_manager, tmp_path):
+    """
+    Reject diffs that attempt git symlink mode (120000) or traverse a symlinked
+    directory/file pointing outside the sandbox workspace.
+    """
+    sb = default_manager.create_sandbox(SandboxCreateRequest(repo_ref="pallets/flask"))
+    workspace = Path(default_manager._sandboxes[sb.sandbox_id]["workspace_path"])
+    outside_dir = tmp_path / "outside_secret"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    outside_target = outside_dir / "escaped.py"
+    try:
+        # 1. Git symlink mode 120000 must be rejected
+        symlink_mode_diff = (
+            "diff --git a/src/link b/src/link\n"
+            "new file mode 120000\n"
+            "--- /dev/null\n"
+            "+++ b/src/link\n"
+            "@@ -0,0 +1 @@\n"
+            "+/etc/passwd\n"
+        )
+        with pytest.raises(InvalidRequestError, match="symlink"):
+            default_manager.apply_diff(DiffApplyRequest(sandbox_id=sb.sandbox_id, diff_text=symlink_mode_diff))
+
+        # 2. Symlinked path component inside workspace must be rejected
+        escape_diff = (
+            "--- a/src/linked_dir/escaped.py\n"
+            "+++ b/src/linked_dir/escaped.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+pwned = True\n"
+        )
+        with patch("os.path.islink", side_effect=lambda p: Path(p).name == "linked_dir"):
+            with pytest.raises(InvalidRequestError, match="symbolic link"):
+                default_manager.apply_diff(DiffApplyRequest(sandbox_id=sb.sandbox_id, diff_text=escape_diff))
+
+        assert not outside_target.exists()
+    finally:
+        default_manager.destroy_sandbox(sb.sandbox_id)
+
+
+def test_rejected_multifile_patch_leaves_no_partial_changes_or_outside_writes(default_manager, tmp_path):
+    """
+    When a multi-file diff contains one valid file and one invalid/traversal file,
+    the entire patch must be rejected upfront without modifying the valid file
+    or writing anything outside the workspace.
+    """
+    sb = default_manager.create_sandbox(SandboxCreateRequest(repo_ref="pallets/flask"))
+    workspace = Path(default_manager._sandboxes[sb.sandbox_id]["workspace_path"])
+    valid_file = workspace / "src" / "safe.py"
+    valid_file.write_text("original = True\n", encoding="utf-8")
+    outside_file = workspace.parent / "escaped_outside.py"
+    if outside_file.exists():
+        outside_file.unlink()
+
+    try:
+        mixed_diff = (
+            "--- a/src/safe.py\n"
+            "+++ b/src/safe.py\n"
+            "@@ -1,1 +1,2 @@\n"
+            " original = True\n"
+            "+modified = True\n"
+            "--- /dev/null\n"
+            "+++ b/../escaped_outside.py\n"
+            "@@ -0,0 +1,1 @@\n"
+            "+escaped = True\n"
+        )
+        with pytest.raises(InvalidRequestError):
+            default_manager.apply_diff(DiffApplyRequest(sandbox_id=sb.sandbox_id, diff_text=mixed_diff))
+
+        # Valid file inside workspace must remain untouched (no partial changes)
+        assert valid_file.read_text(encoding="utf-8") == "original = True\n"
+        # File outside workspace must not be created
+        assert not outside_file.exists()
+        # Temporary change.patch must not exist
+        assert not (workspace / "change.patch").exists()
+    finally:
+        default_manager.destroy_sandbox(sb.sandbox_id)

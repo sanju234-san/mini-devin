@@ -15,7 +15,7 @@ import time
 from typing import Any
 
 from groq import Groq
-import google.generativeai as genai
+import google as genai
 from huggingface_hub import InferenceClient
 
 from app.config import GROQ_API_KEY, GOOGLE_AI_STUDIO_API_KEY, HUGGINGFACE_API_TOKEN
@@ -70,10 +70,15 @@ def _call_gemini(prompt: str) -> str:
     gemini_key = os.getenv("GOOGLE_AI_STUDIO_API_KEY") or GOOGLE_AI_STUDIO_API_KEY
     if not gemini_key:
         raise RuntimeError("GOOGLE_AI_STUDIO_API_KEY not configured")
-    genai.configure(api_key=gemini_key)
-    model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
-    model = genai.GenerativeModel(model_name)
-    response = model.generate_content(prompt)
+    # genai.configure(api_key=gemini_key)
+    model_name = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+    # model = genai.GenerativeModel(model_name)
+    client = genai.Client(api_key=gemini_key)
+
+    response = client.models.generate_content(
+        model = model_name,
+        contents=prompt,
+    )
     return response.text
 
 def _call_huggingface(prompt: str) -> str:

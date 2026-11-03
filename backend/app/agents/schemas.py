@@ -272,6 +272,7 @@ class AgentState(TypedDict, total=False):
     repo_ref: Optional[str]
     commit_sha: Optional[str]
     snapshot_path: Optional[str]
+    workspace_path: Optional[str]
     snapshot_truncated: bool
     snapshot_truncation_reason: Optional[str]
     issue_metadata: Optional[dict[str, Any]]
@@ -500,6 +501,7 @@ def create_initial_state(
     repo_ref: Optional[str] = None,
     commit_sha: Optional[str] = None,
     snapshot_path: Optional[str] = None,
+    workspace_path: Optional[str] = None,
     issue_metadata: Optional[dict[str, Any]] = None,
     run_id: Optional[str] = None,
     thread_id: Optional[str] = None,
@@ -530,6 +532,7 @@ def create_initial_state(
             "issue_number": issue_number,
             "commit_sha": commit_sha,
             "snapshot_path": snapshot_path,
+        "workspace_path": workspace_path,
         },
     )
 
@@ -544,6 +547,7 @@ def create_initial_state(
         "repo_ref": repo_ref,
         "commit_sha": commit_sha,
         "snapshot_path": snapshot_path,
+        "workspace_path": workspace_path,
         "snapshot_truncated": False,
         "snapshot_truncation_reason": None,
         "issue_metadata": issue_metadata,
@@ -732,6 +736,7 @@ class FileChange(BaseSchema):
     path: str
     change_type: ChangeType = ChangeType.MODIFY
     diff_text: str = ""
+    content: Optional[str] = None
     requirement_ids: list[str] = Field(default_factory=list)
 
     @property
